@@ -40,6 +40,7 @@ go install github.com/seqyuan/patternqc@v1.0.0
 git clone https://github.com/seqyuan/patternqc.git
 cd patternqc
 
+
 # 编译
 go build -o patternqc patternqc.go
 ```
@@ -184,6 +185,44 @@ patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pigz /usr/
 3. **用户安装**：
    ```bash
    go install github.com/seqyuan/patternqc@latest
+   ```
+
+## CI/CD 自动化
+
+本项目使用 GitHub Actions 进行自动化构建和发布：
+
+### 工作流说明
+
+- **CI 工作流** (`.github/workflows/ci.yml`)：
+  - 在每次 push 和 pull request 时触发
+  - 运行代码质量检查、测试和构建验证
+  - 支持多个 Go 版本测试
+
+- **Go 模块验证** (`.github/workflows/go-mod.yml`)：
+  - 验证 go.mod 和 go.sum 文件的正确性
+  - 检查许可证合规性
+
+- **发布工作流** (`.github/workflows/release.yml`)：
+  - 在推送版本标签时触发
+  - 自动构建多平台二进制文件
+  - 创建 GitHub Release 并上传构建产物
+
+### 自动发布流程
+
+1. **创建新版本标签**：
+   ```bash
+   git tag v1.1.0
+   git push origin v1.1.0
+   ```
+
+2. **自动触发发布**：
+   - GitHub Actions 自动构建 Linux、Windows、macOS 版本
+   - 创建 Release 页面
+   - 上传二进制文件供用户下载
+
+3. **用户安装**：
+   ```bash
+   go install github.com/seqyuan/patternqc@v1.1.0
    ```
 
 ## 技术支持
