@@ -1,4 +1,4 @@
-name: Release
+name: Release with Docker
 
 on:
   push:
@@ -15,59 +15,57 @@ jobs:
             arch: amd64
             goos: linux
             goarch: amd64
-            go-version: '1.22'
+            docker-image: golang:1.22-alpine
             binary-name: patternqc
           - os: linux
             arch: arm64
             goos: linux
             goarch: arm64
-            go-version: '1.22'
+            docker-image: golang:1.22-alpine
             binary-name: patternqc
           - os: windows
             arch: amd64
             goos: windows
             goarch: amd64
-            go-version: '1.22'
+            docker-image: golang:1.22-windowsservercore
             binary-name: patternqc.exe
           - os: darwin
             arch: amd64
             goos: darwin
             goarch: amd64
-            go-version: '1.22'
+            docker-image: golang:1.22-alpine
             binary-name: patternqc
           - os: darwin
             arch: arm64
             goos: darwin
             goarch: arm64
-            go-version: '1.22'
+            docker-image: golang:1.22-alpine
             binary-name: patternqc
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: ${{ matrix.go-version }}
-
-    - name: Build static binary
-      env:
-        GOOS: ${{ matrix.goos }}
-        GOARCH: ${{ matrix.goarch }}
-        CGO_ENABLED: 0
-        GOFLAGS: -ldflags="-s -w -extldflags=-static"
+    - name: Build with Docker
       run: |
-        go mod download
-        go mod verify
-        go build -v -ldflags="-s -w -extldflags=-static" -o patternqc-${{ matrix.os }}-${{ matrix.arch }} patternqc.go
+        docker run --rm -v "$PWD:/app" -w /app ${{ matrix.docker-image }} sh -c "
+          apk add --no-cache gcc musl-dev
+          export GOOS=${{ matrix.goos }}
+          export GOARCH=${{ matrix.goarch }}
+          export CGO_ENABLED=0
+          go mod download
+          go mod verify
+          go build -v -ldflags='-s -w -extldflags=-static' -o patternqc-${{ matrix.os }}-${{ matrix.arch }} patternqc.go
+        "
 
     - name: Test binary
+      if: matrix.os == 'linux'
       run: |
-        if [ "${{ matrix.os }}" = "linux" ]; then
+        docker run --rm -v "$PWD:/app" -w /app alpine:latest sh -c "
+          chmod +x patternqc-${{ matrix.os }}-${{ matrix.arch }}
           ./patternqc-${{ matrix.os }}-${{ matrix.arch }} -version
-          ./patternqc-${{ matrix.os }}-${{ matrix.arch }} 2>&1 | grep -q "Error: -fq1, -fq2 and -outdir are required" || exit 1
-        fi
+          ./patternqc-${{ matrix.os }}-${{ matrix.arch }} 2>&1 | grep -q 'Error: -fq1, -fq2 and -outdir are required' || exit 1
+        "
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4

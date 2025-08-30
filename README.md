@@ -24,7 +24,7 @@ go install github.com/seqyuan/patternqc@latest
 go install github.com/seqyuan/patternqc@v1.0.0
 ```
 
-安装后，`pattern_filter` 命令会被安装到 `$GOPATH/bin` 目录中，确保该目录在你的 `PATH` 环境变量中。
+安装后，`patternqc` 命令会被安装到 `$GOPATH/bin` 目录中，确保该目录在你的 `PATH` 环境变量中。
 
 ### 方法二：从源码编译
 
@@ -60,7 +60,7 @@ patternqc
 ### 基本语法
 
 ```bash
-./pattern_filter [选项]
+./patternqc [选项]
 ```
 
 ### 必需参数
@@ -207,6 +207,11 @@ patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pigz /usr/
   - 自动构建多平台二进制文件
   - 创建 GitHub Release 并上传构建产物
 
+- **静态编译发布** (`.github/workflows/release-static.yml`)：
+  - 使用 musl 编译 Linux 版本，解决 glibc 兼容性问题
+  - 生成完全静态链接的二进制文件
+  - 支持低版本 Linux 系统运行
+
 ### 自动发布流程
 
 1. **创建新版本标签**：
@@ -217,8 +222,14 @@ patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pigz /usr/
 
 2. **自动触发发布**：
    - GitHub Actions 自动构建 Linux、Windows、macOS 版本
+   - 使用 musl 编译 Linux 版本，确保在低版本系统上运行
    - 创建 Release 页面
    - 上传二进制文件供用户下载
+
+3. **兼容性保证**：
+   - Linux 版本使用静态编译，不依赖 glibc
+   - 支持 ARM64 和 AMD64 架构
+   - 可在 CentOS 6+、Ubuntu 14+ 等老版本系统运行
 
 3. **用户安装**：
    ```bash
