@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        go-version: ['1.22', '1.23']
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ matrix.go-version }}
+
+    - name: Build
+      run: |
+        go mod download
+        go mod verify
+        go build -v -o patternqc patternqc.go
+
+    - name: Test
+      run: |
+        go test -v ./...
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: patternqc-${{ matrix.os }}-${{ matrix.go-version }}
+        path: patternqc*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          patternqc-ubuntu-latest-1.22/patternqc
+          patternqc-ubuntu-latest-1.23/patternqc
+          patternqc-windows-latest-1.22/patternqc.exe
+          patternqc-windows-latest-1.23/patternqc.exe
+          patternqc-macos-latest-1.22/patternqc
+          patternqc-macos-latest-1.23/patternqc
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

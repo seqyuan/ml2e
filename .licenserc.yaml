@@ -1,0 +1,11 @@
+header:
+  license:
+    spdx-id: MIT
+    copyright-owner: seqyuan
+  paths-ignore:
+    - "*.md"
+    - "*.yml"
+    - "*.yaml"
+    - ".gitignore"
+    - "go.mod"
+    - "go.sum"

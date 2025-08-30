@@ -34,3 +34,6 @@ Thumbs.db
 
 # 日志文件
 *.log
+
+# GitHub Actions
+.github/workflows/*.log
