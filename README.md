@@ -129,88 +129,13 @@ patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pigz /usr/
 5. **顺序输出**：确保输出文件中的 reads 顺序与输入文件一致
 6. **批量写入**：使用批量写入提高 I/O 性能
 7. **pigz 压缩**：可选的后处理压缩，使用 pigz 进行多线程压缩
+8. **pigz 路径**：如果使用 `-pigz` 参数，确保指定的 pigz 路径存在且可执行
 
-## 性能优化
+## 安装
 
-- **多线程处理**：支持可配置的工作线程数
-- **批量写入**：使用 1000 条 reads 的批次进行写入
-- **内存优化**：使用有序队列管理处理结果
-- **I/O 优化**：支持压缩文件，减少磁盘 I/O
-- **pigz 压缩**：使用 pigz 进行多线程压缩，压缩线程数与工作线程数一致
-
-## 注意事项
-
-1. **文件格式**：输入文件必须是有效的 FASTQ 格式
-2. **文件配对**：R1 和 R2 文件必须包含相同数量的 reads
-3. **内存使用**：处理大文件时注意内存使用情况
-4. **磁盘空间**：确保输出目录有足够的磁盘空间
-5. **pigz 路径**：如果使用 `-pigz` 参数，确保指定的 pigz 路径存在且可执行
-
-## 错误处理
-
-程序包含完善的错误处理机制：
-
-- 文件不存在或无法访问
-- 文件格式错误
-- 内存不足
-- 磁盘空间不足
-- 超时保护
-- pigz 路径不存在或不可执行
-
-## 版本信息
-
-- 版本：1.0.0
-- 作者：seqyuan
-- 许可证：MIT
-
-## 发布说明
-
-要让用户能够通过 `go install` 安装此工具，需要：
-
-1. **创建 GitHub 仓库**：
-   ```bash
-   git init
-   git add .
-   git commit -m "Initial commit"
-   git remote add origin https://github.com/seqyuan/patternqc.git
-   git push -u origin main
-   ```
-
-2. **创建 Git 标签**：
-   ```bash
-   git tag v1.0.0
-   git push origin v1.0.0
-   ```
-
-3. **用户安装**：
    ```bash
    go install github.com/seqyuan/patternqc@latest
    ```
-
-## CI/CD 自动化
-
-本项目使用 GitHub Actions 进行自动化构建和发布：
-
-### 工作流说明
-
-- **CI 工作流** (`.github/workflows/ci.yml`)：
-  - 在每次 push 和 pull request 时触发
-  - 运行代码质量检查、测试和构建验证
-  - 支持多个 Go 版本测试
-
-- **Go 模块验证** (`.github/workflows/go-mod.yml`)：
-  - 验证 go.mod 和 go.sum 文件的正确性
-  - 检查许可证合规性
-
-- **发布工作流** (`.github/workflows/release.yml`)：
-  - 在推送版本标签时触发
-  - 自动构建多平台二进制文件
-  - 创建 GitHub Release 并上传构建产物
-
-- **静态编译发布** (`.github/workflows/release-static.yml`)：
-  - 使用 musl 编译 Linux 版本，解决 glibc 兼容性问题
-  - 生成完全静态链接的二进制文件
-  - 支持低版本 Linux 系统运行
 
 ### 自动发布流程
 
@@ -218,22 +143,6 @@ patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pigz /usr/
    ```bash
    git tag v1.1.0
    git push origin v1.1.0
-   ```
-
-2. **自动触发发布**：
-   - GitHub Actions 自动构建 Linux、Windows、macOS 版本
-   - 使用 musl 编译 Linux 版本，确保在低版本系统上运行
-   - 创建 Release 页面
-   - 上传二进制文件供用户下载
-
-3. **兼容性保证**：
-   - Linux 版本使用静态编译，不依赖 glibc
-   - 支持 ARM64 和 AMD64 架构
-   - 可在 CentOS 6+、Ubuntu 14+ 等老版本系统运行
-
-3. **用户安装**：
-   ```bash
-   go install github.com/seqyuan/patternqc@v1.1.0
    ```
 
 ## 技术支持
