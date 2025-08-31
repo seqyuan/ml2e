@@ -294,7 +294,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 				if results == nil {
 					// 队列已关闭，处理剩余批次
 					if len(batch) > 0 {
-						writeBatch(batch, w1, w2, &keptPatternReads, &totalOutputReads, &mu)
+						writeBatchSeparate(batch, w1, w2, &keptPatternReads, &totalOutputReads, &mu)
 					}
 					break
 				}
@@ -303,7 +303,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 
 				// 当批次满了时写入
 				if len(batch) >= batchSize {
-					writeBatch(batch, w1, w2, &keptPatternReads, &totalOutputReads, &mu)
+					writeBatchSeparate(batch, w1, w2, &keptPatternReads, &totalOutputReads, &mu)
 					batch = batch[:0] // 清空批次
 
 					if outputWorkerID == 0 {
@@ -480,6 +480,58 @@ func writeBatch(batch []*ProcessResult, w1, w2 fastq.Writer, keptPatternReads *i
 			mu.Unlock()
 		}
 	}
+}
+
+// 分离的写入函数 - 每个文件使用独立线程
+func writeBatchSeparate(batch []*ProcessResult, w1, w2 fastq.Writer, keptPatternReads *int, totalOutputReads *int, mu *sync.Mutex) {
+	// 分离R1和R2的数据
+	var r1Data, r2Data []fastq.Sequence
+	
+	for _, result := range batch {
+		if result.Keep {
+			r1Data = append(r1Data, result.Seq1)
+			r2Data = append(r2Data, result.Seq2)
+		}
+	}
+	
+	// 使用goroutine并行写入两个文件
+	var wg sync.WaitGroup
+	wg.Add(2)
+	
+	// 写入R1文件
+	go func() {
+		defer wg.Done()
+		for _, seq := range r1Data {
+			if _, err := w1.Write(seq); err != nil {
+				log.Printf("error writing to fq1: %v", err)
+				return
+			}
+		}
+	}()
+	
+	// 写入R2文件
+	go func() {
+		defer wg.Done()
+		for _, seq := range r2Data {
+			if _, err := w2.Write(seq); err != nil {
+				log.Printf("error writing to fq2: %v", err)
+				return
+			}
+		}
+	}()
+	
+	// 等待两个写入完成
+	wg.Wait()
+	
+	// 统计输出
+	mu.Lock()
+	*totalOutputReads += len(r1Data)
+	for _, result := range batch {
+		if result.Keep && result.HasPattern {
+			*keptPatternReads++
+		}
+	}
+	mu.Unlock()
 }
 
 func usage() {
