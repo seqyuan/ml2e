@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -30,34 +31,43 @@ type ProcessResult struct {
 	Keep       bool
 }
 
-// 线程安全的顺序队列 - 优化版本
+// 线程安全的顺序队列 - 内存优化版本
 type OrderedQueue struct {
-	mu          sync.Mutex
-	results     map[int]*ProcessResult
-	nextIndex   int
-	cond        *sync.Cond
-	closed      bool
-	workerCount int // 新增：跟踪活跃的worker数量
+	mu           sync.Mutex
+	results      map[int]*ProcessResult
+	nextIndex    int
+	cond         *sync.Cond
+	closed       bool
+	maxQueueSize int // 新增：限制队列最大大小
 }
 
 func NewOrderedQueue() *OrderedQueue {
 	q := &OrderedQueue{
-		results:     make(map[int]*ProcessResult),
-		nextIndex:   0,
-		closed:      false,
-		workerCount: 0,
+		results:      make(map[int]*ProcessResult),
+		nextIndex:    0,
+		closed:       false,
+		maxQueueSize: 10000, // 限制队列最大10000个结果
 	}
 	q.cond = sync.NewCond(&q.mu)
 	return q
 }
 
-// 添加结果到队列
+// 添加结果到队列 - 添加内存控制
 func (q *OrderedQueue) Add(result *ProcessResult) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	if q.closed {
 		return
+	}
+
+	// 如果队列太大，等待处理
+	for len(q.results) >= q.maxQueueSize {
+		fmt.Printf("Warning: Queue full (%d), waiting for processing...\n", len(q.results))
+		q.cond.Wait()
+		if q.closed {
+			return
+		}
 	}
 
 	q.results[result.Index] = result
@@ -73,6 +83,8 @@ func (q *OrderedQueue) GetNext() *ProcessResult {
 		if result, exists := q.results[q.nextIndex]; exists {
 			delete(q.results, q.nextIndex)
 			q.nextIndex++
+			// 通知等待的Add操作
+			q.cond.Signal()
 			return result
 		}
 
@@ -151,6 +163,32 @@ func (q *OrderedQueue) GetStatus() (int, int, int) {
 	}
 
 	return len(q.results), q.nextIndex, maxIndex
+}
+
+// 强制清理队列中的旧数据
+func (q *OrderedQueue) Cleanup() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	// 清理超过最大大小的旧数据
+	if len(q.results) > q.maxQueueSize {
+		// 找到需要清理的索引范围
+		toDelete := make([]int, 0)
+		for idx := range q.results {
+			if idx < q.nextIndex-q.maxQueueSize/2 {
+				toDelete = append(toDelete, idx)
+			}
+		}
+
+		// 删除旧数据
+		for _, idx := range toDelete {
+			delete(q.results, idx)
+		}
+
+		if len(toDelete) > 0 {
+			fmt.Printf("Cleaned up %d old results from queue\n", len(toDelete))
+		}
+	}
 }
 
 // 反向互补序列
@@ -335,7 +373,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 		}()
 	}
 
-	// 启动输出goroutine - 优化版本
+	// 启动输出goroutine - 内存优化版本
 	outputDone := make(chan bool)
 	go func() {
 		defer func() { outputDone <- true }()
@@ -343,6 +381,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 		// 批量写入以提高性能
 		batchSize := 1000
 		batch := make([]*ProcessResult, 0, batchSize)
+		cleanupCounter := 0
 
 		for {
 			result := queue.GetNext()
@@ -360,6 +399,13 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 			if len(batch) >= batchSize {
 				writeBatch(batch, w1, w2, &keptPatternReads, &totalOutputReads, &mu)
 				batch = batch[:0] // 清空批次
+
+				// 定期清理队列内存
+				cleanupCounter++
+				if cleanupCounter >= 10 { // 每10个批次清理一次
+					queue.Cleanup()
+					cleanupCounter = 0
+				}
 			}
 		}
 	}()
@@ -391,11 +437,24 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 
 		index++
 
-		// 每处理100000个reads输出一次进度，包括队列状态
+		// 每处理100000个reads输出一次进度，包括队列状态和内存使用
 		if totalReads%100000 == 0 {
 			queueLen, nextIdx, maxIdx := queue.GetStatus()
-			fmt.Printf("Processed %d reads, Queue: %d, Next: %d, Max: %d\n",
-				totalReads, queueLen, nextIdx, maxIdx)
+
+			// 获取内存使用情况
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+
+			fmt.Printf("Processed %d reads, Queue: %d, Next: %d, Max: %d, Memory: %.2f GB\n",
+				totalReads, queueLen, nextIdx, maxIdx, float64(m.Alloc)/1024/1024/1024)
+
+			// 如果内存使用过高，强制垃圾回收
+			if m.Alloc > 8*1024*1024*1024 { // 超过8GB
+				fmt.Printf("High memory usage detected (%.2f GB), forcing garbage collection...\n",
+					float64(m.Alloc)/1024/1024/1024)
+				runtime.GC()
+				queue.Cleanup()
+			}
 		}
 	}
 
