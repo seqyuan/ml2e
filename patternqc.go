@@ -246,8 +246,8 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 	w2 := fastq.NewWriter(writer2)
 
 	// 创建高性能缓冲写入器
-	bufferedW1 := NewBufferedFastqWriter(w1, outFile1, 4*1024*1024) // 增加到4MB缓冲区
-	bufferedW2 := NewBufferedFastqWriter(w2, outFile2, 4*1024*1024) // 增加到4MB缓冲区
+	bufferedW1 := NewBufferedFastqWriter(w1, outFile1, 8*1024*1024) // 增加到8MB缓冲区
+	bufferedW2 := NewBufferedFastqWriter(w2, outFile2, 8*1024*1024) // 增加到8MB缓冲区
 	defer bufferedW1.Close()
 	defer bufferedW2.Close()
 
@@ -292,7 +292,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 
 	// 启动多个输出goroutine - 真正的多线程输出
 	outputDone := make(chan bool)
-	numOutputWorkers := numWorkers // 使用与worker数量相同的输出线程
+	numOutputWorkers := 4 // 使用4个输出线程
 
 	for i := 0; i < numOutputWorkers; i++ {
 		go func(outputWorkerID int) {
@@ -303,7 +303,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 			}()
 
 			// 每个输出线程处理自己的批次
-			batchSize := 500000 // 增加到50万个结果
+			batchSize := 1000000 // 恢复到100万个结果
 			batch := make([]*ProcessResult, 0, batchSize)
 
 			for {
