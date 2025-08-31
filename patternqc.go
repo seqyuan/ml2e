@@ -22,38 +22,30 @@ const (
 	BuildTime = "2024-08-30"
 )
 
-// 处理结果结构
+// 简化的结果结构 - 只需要配对信息
 type ProcessResult struct {
-	Index      int // 读取顺序索引
 	Seq1       fastq.Sequence
 	Seq2       fastq.Sequence
 	HasPattern bool
 	Keep       bool
 }
 
-// 线程安全的顺序队列 - 高性能版本
-type OrderedQueue struct {
-	mu           sync.Mutex
-	results      map[int]*ProcessResult
-	nextIndex    int
-	cond         *sync.Cond
-	closed       bool
-	maxQueueSize int // 新增：限制队列最大大小
+// 简化的队列 - 不需要顺序控制
+type SimpleQueue struct {
+	mu      sync.Mutex
+	results []*ProcessResult
+	closed  bool
 }
 
-func NewOrderedQueue() *OrderedQueue {
-	q := &OrderedQueue{
-		results:      make(map[int]*ProcessResult),
-		nextIndex:    0,
-		closed:       false,
-		maxQueueSize: 5000000, // 增加到500万个结果，大幅提高并发性能
+func NewSimpleQueue() *SimpleQueue {
+	return &SimpleQueue{
+		results: make([]*ProcessResult, 0, 100000), // 预分配10万容量
+		closed:  false,
 	}
-	q.cond = sync.NewCond(&q.mu)
-	return q
 }
 
-// 添加结果到队列 - 无阻塞版本
-func (q *OrderedQueue) Add(result *ProcessResult) {
+// 添加结果到队列 - 无顺序要求
+func (q *SimpleQueue) Add(result *ProcessResult) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -61,124 +53,36 @@ func (q *OrderedQueue) Add(result *ProcessResult) {
 		return
 	}
 
-	// 移除队列大小限制，让worker完全不被阻塞
-	q.results[result.Index] = result
-	q.cond.Signal()
+	q.results = append(q.results, result)
 }
 
-// 获取下一个可输出的结果 - 优化版本
-func (q *OrderedQueue) GetNext() *ProcessResult {
+// 获取所有结果并清空队列
+func (q *SimpleQueue) GetAll() []*ProcessResult {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	for {
-		if result, exists := q.results[q.nextIndex]; exists {
-			delete(q.results, q.nextIndex)
-			q.nextIndex++
-			return result
-		}
-
-		// 检查是否所有工作都完成了
-		if q.closed && len(q.results) == 0 {
-			return nil // 表示结束
-		}
-
-		// 使用更短的超时时间，减少阻塞
-		done := make(chan struct{})
-		go func() {
-			q.cond.Wait()
-			close(done)
-		}()
-
-		select {
-		case <-done:
-			// 继续循环
-		case <-time.After(100 * time.Microsecond): // 减少到100微秒
-			// 超时，检查是否有数据丢失
-			if len(q.results) > 0 {
-				// 找到最小的index
-				minIndex := q.nextIndex
-				for idx := range q.results {
-					if idx < minIndex {
-						minIndex = idx
-					}
-				}
-				if minIndex < q.nextIndex {
-					// 有数据丢失，调整nextIndex
-					fmt.Printf("Warning: Data gap detected, adjusting nextIndex from %d to %d\n", q.nextIndex, minIndex)
-					q.nextIndex = minIndex
-				}
-			}
-		}
+	if len(q.results) == 0 {
+		return nil
 	}
+
+	// 返回所有结果并清空队列
+	results := q.results
+	q.results = make([]*ProcessResult, 0, 100000)
+	return results
 }
 
 // 关闭队列
-func (q *OrderedQueue) Close() {
+func (q *SimpleQueue) Close() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-
 	q.closed = true
-	q.cond.Broadcast()
-}
-
-// 检查队列状态
-func (q *OrderedQueue) IsEmpty() bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return len(q.results) == 0
 }
 
 // 获取队列长度
-func (q *OrderedQueue) Len() int {
+func (q *SimpleQueue) Len() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.results)
-}
-
-// 获取队列详细信息
-func (q *OrderedQueue) GetStatus() (int, int, int) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	minIndex := q.nextIndex
-	maxIndex := q.nextIndex
-	for idx := range q.results {
-		if idx < minIndex {
-			minIndex = idx
-		}
-		if idx > maxIndex {
-			maxIndex = idx
-		}
-	}
-
-	return len(q.results), q.nextIndex, maxIndex
-}
-
-// 强制清理队列中的旧数据 - 优化版本
-func (q *OrderedQueue) Cleanup() {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	// 只在队列过大时才清理
-	if len(q.results) > q.maxQueueSize*95/100 { // 超过95%时才清理
-		// 找到需要清理的索引范围
-		toDelete := make([]int, 0)
-		for idx := range q.results {
-			if idx < q.nextIndex-q.maxQueueSize/20 { // 只清理最旧的5%
-				toDelete = append(toDelete, idx)
-			}
-		}
-
-		// 删除旧数据
-		for _, idx := range toDelete {
-			delete(q.results, idx)
-		}
-
-		if len(toDelete) > 0 {
-			fmt.Printf("Cleaned up %d old results from queue (queue size: %d)\n", len(toDelete), len(q.results))
-		}
-	}
 }
 
 // 反向互补序列
@@ -258,7 +162,7 @@ func createWriter(filePath string) (io.Writer, *os.File, error) {
 }
 
 // 处理单个read pair的worker函数
-func processReadPair(seq1, seq2 fastq.Sequence, index int, pattern string, keepEveryN int, patternCount *int, mu *sync.Mutex) *ProcessResult {
+func processReadPair(seq1, seq2 fastq.Sequence, pattern string, keepEveryN int, patternCount *int, mu *sync.Mutex) *ProcessResult {
 	hasPattern := containsPattern(string(seq2.Letters), pattern)
 
 	var keep bool
@@ -274,7 +178,6 @@ func processReadPair(seq1, seq2 fastq.Sequence, index int, pattern string, keepE
 	}
 
 	return &ProcessResult{
-		Index:      index,
 		Seq1:       seq1,
 		Seq2:       seq2,
 		HasPattern: hasPattern,
@@ -332,7 +235,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 	w2 := fastq.NewWriter(writer2)
 
 	// 创建顺序队列和同步原语
-	queue := NewOrderedQueue()
+	queue := NewSimpleQueue()
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
@@ -346,9 +249,8 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 
 	// 创建worker池 - 无限制缓冲区
 	workChan := make(chan struct {
-		seq1  fastq.Sequence
-		seq2  fastq.Sequence
-		index int
+		seq1 fastq.Sequence
+		seq2 fastq.Sequence
 	}, numWorkers*1000) // 极大增加缓冲区，确保worker完全不被阻塞
 
 	// 启动worker goroutines - 高性能版本
@@ -358,7 +260,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 			defer wg.Done()
 			processedCount := 0
 			for work := range workChan {
-				result := processReadPair(work.seq1, work.seq2, work.index, pattern, keepEveryN, &patternReads, &mu)
+				result := processReadPair(work.seq1, work.seq2, pattern, keepEveryN, &patternReads, &mu)
 				queue.Add(result)
 				processedCount++
 
@@ -371,42 +273,46 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 		}(i)
 	}
 
-	// 启动输出goroutine - 高性能版本
+	// 启动多个输出goroutine - 真正的多线程输出
 	outputDone := make(chan bool)
-	go func() {
-		defer func() { outputDone <- true }()
+	numOutputWorkers := 4 // 使用4个输出线程
 
-		// 增加批量写入大小，提高I/O效率
-		batchSize := 1000000 // 增加到100万个结果，大幅提高I/O效率
-		batch := make([]*ProcessResult, 0, batchSize)
-		cleanupCounter := 0
+	for i := 0; i < numOutputWorkers; i++ {
+		go func(outputWorkerID int) {
+			defer func() {
+				if outputWorkerID == 0 {
+					outputDone <- true
+				}
+			}()
 
-		for {
-			result := queue.GetNext()
-			if result == nil {
-				// 队列已关闭，处理剩余批次
-				if len(batch) > 0 {
+			// 每个输出线程处理自己的批次
+			batchSize := 250000 // 每个线程25万个结果
+			batch := make([]*ProcessResult, 0, batchSize)
+
+			for {
+				results := queue.GetAll()
+				if results == nil {
+					// 队列已关闭，处理剩余批次
+					if len(batch) > 0 {
+						writeBatch(batch, w1, w2, &keptPatternReads, &totalOutputReads, &mu)
+					}
+					break
+				}
+
+				batch = append(batch, results...)
+
+				// 当批次满了时写入
+				if len(batch) >= batchSize {
 					writeBatch(batch, w1, w2, &keptPatternReads, &totalOutputReads, &mu)
-				}
-				break
-			}
+					batch = batch[:0] // 清空批次
 
-			batch = append(batch, result)
-
-			// 当批次满了时写入
-			if len(batch) >= batchSize {
-				writeBatch(batch, w1, w2, &keptPatternReads, &totalOutputReads, &mu)
-				batch = batch[:0] // 清空批次
-
-				// 大幅减少清理频率
-				cleanupCounter++
-				if cleanupCounter >= 1000 { // 每1000个批次清理一次
-					queue.Cleanup()
-					cleanupCounter = 0
+					if outputWorkerID == 0 {
+						fmt.Printf("Output worker %d wrote batch of %d results\n", outputWorkerID, batchSize)
+					}
 				}
 			}
-		}
-	}()
+		}(i)
+	}
 
 	// 读取并分发工作 - 高性能版本
 	index := 0
@@ -418,30 +324,29 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 
 		// 发送工作到worker池 - 无阻塞版本
 		workChan <- struct {
-			seq1  fastq.Sequence
-			seq2  fastq.Sequence
-			index int
-		}{seq1, seq2, index}
+			seq1 fastq.Sequence
+			seq2 fastq.Sequence
+		}{seq1, seq2}
 
 		index++
 
 		// 每处理100000个reads输出一次进度，包括队列状态和内存使用
 		if totalReads%100000 == 0 {
-			queueLen, nextIdx, maxIdx := queue.GetStatus()
+			queueLen := queue.Len()
 
 			// 获取内存使用情况
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
 
-			fmt.Printf("Processed %d reads, Queue: %d, Next: %d, Max: %d, Memory: %.2f GB\n",
-				totalReads, queueLen, nextIdx, maxIdx, float64(m.Alloc)/1024/1024/1024)
+			fmt.Printf("Processed %d reads, Queue: %d, Memory: %.2f GB\n",
+				totalReads, queueLen, float64(m.Alloc)/1024/1024/1024)
 
 			// 如果内存使用过高，强制垃圾回收（调整到48GB）
 			if m.Alloc > 48*1024*1024*1024 { // 超过48GB
 				fmt.Printf("High memory usage detected (%.2f GB), forcing garbage collection...\n",
 					float64(m.Alloc)/1024/1024/1024)
 				runtime.GC()
-				queue.Cleanup()
+				// queue.Cleanup() // 移除旧的清理逻辑
 			}
 		}
 	}
@@ -470,8 +375,8 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 		fmt.Println("Output completed successfully")
 	case <-time.After(timeout):
 		fmt.Printf("Warning: Output timeout after %v, but processing completed\n", timeout)
-		queueLen, nextIdx, maxIdx := queue.GetStatus()
-		fmt.Printf("Final queue status - Length: %d, Next: %d, Max: %d\n", queueLen, nextIdx, maxIdx)
+		queueLen := queue.Len()
+		fmt.Printf("Final queue status - Length: %d\n", queueLen)
 	}
 
 	if err := scanner1.Error(); err != nil {
