@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	Version   = "5.3.0"
+	Version   = "5.3.2"
 	BuildTime = "2024-12-19"
 )
 
@@ -1229,7 +1229,7 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 		}
 	}
 
-		return nil
+	return nil
 }
 
 // 双线程并行读取模式
