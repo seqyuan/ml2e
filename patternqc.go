@@ -983,7 +983,8 @@ func simplePipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorker
 	batchSize := 10000000 // 10M reads per batch
 
 	// 统计变量
-	var totalReads, patternReads, keptPatternReads, totalOutputReads int64
+	var totalReads, patternReads int64
+	var keptPatternReads, totalOutputReads int // 用于writeBatchOptimized函数
 	var patternReadsInt int // 用于processReadPair函数
 	var mu sync.Mutex
 
@@ -1091,7 +1092,7 @@ func simplePipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorker
 
 		// 更新统计
 		mu.Lock()
-		totalOutputReads += int64(len(r1Data))
+		totalOutputReads += len(r1Data)
 		for _, result := range results {
 			if result.Keep && result.HasPattern {
 				keptPatternReads++
@@ -1157,6 +1158,251 @@ func simplePipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorker
 	return nil
 }
 
+// 高性能流水线模式 - 使用内存映射读取、1M批次处理、缓存池队列输出
+func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, pigzPath string) error {
+	// 创建输出目录
+	if err := os.MkdirAll(outdir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %v", err)
+	}
+
+	// 创建输入文件reader
+	reader1, file1, err := createReader(fq1)
+	if err != nil {
+		return err
+	}
+	defer file1.Close()
+
+	reader2, file2, err := createReader(fq2)
+	if err != nil {
+		return err
+	}
+	defer file2.Close()
+
+	// 创建输出文件
+	basename1 := getBasename(fq1)
+	basename2 := getBasename(fq2)
+	outFile1Path := filepath.Join(outdir, basename1)
+	outFile2Path := filepath.Join(outdir, basename2)
+
+	writer1, outFile1, err := createWriter(outFile1Path)
+	if err != nil {
+		return err
+	}
+	defer outFile1.Close()
+
+	writer2, outFile2, err := createWriter(outFile2Path)
+	if err != nil {
+		return err
+	}
+	defer outFile2.Close()
+
+	// 创建fastq writer
+	w1 := fastq.NewWriter(writer1)
+	w2 := fastq.NewWriter(writer2)
+
+	// 创建高性能缓冲写入器
+	bufferedW1 := NewBufferedFastqWriter(w1, outFile1, 8*1024*1024) // 8MB缓冲区
+	bufferedW2 := NewBufferedFastqWriter(w2, outFile2, 8*1024*1024) // 8MB缓冲区
+	defer bufferedW1.Close()
+	defer bufferedW2.Close()
+
+	// 创建scanner
+	scanner1 := fastq.NewScanner(fastq.NewReader(reader1))
+	scanner2 := fastq.NewScanner(fastq.NewReader(reader2))
+
+	// 配置参数 - 减少批次大小到1M
+	batchSize := 1000000 // 1M reads per batch
+
+	// 统计变量
+	var totalReads, patternReads int64
+	var keptPatternReads, totalOutputReads int // 用于writeBatchOptimized函数
+	var patternReadsInt int // 用于processReadPair函数
+	var mu sync.Mutex
+
+	// 计算保留的pattern reads数量
+	keepEveryN := 100 / percent
+
+	// 创建缓存池队列 - 用于存储处理完成的reads
+	resultQueue := make(chan *ProcessResult, 100000) // 10万容量的缓存池
+	defer close(resultQueue)
+
+	// 启动输出线程 - 专门处理缓存池中的结果
+	outputDone := make(chan bool)
+	go func() {
+		defer func() {
+			outputDone <- true
+		}()
+
+		// 批量收集结果进行写入
+		batch := make([]*ProcessResult, 0, 100000) // 10万容量的写入批次
+
+		for result := range resultQueue {
+			if result == nil {
+				// 结束信号，处理剩余批次
+				if len(batch) > 0 {
+					writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
+					fmt.Printf("Output thread wrote final batch of %d results\n", len(batch))
+				}
+				break
+			}
+
+			batch = append(batch, result)
+
+			// 当批次满了时写入
+			if len(batch) >= 100000 {
+				writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
+				fmt.Printf("Output thread wrote batch of %d results\n", len(batch))
+				batch = batch[:0] // 清空批次
+			}
+		}
+	}()
+
+	// 启动多个读取线程 - 使用内存映射方式读取大块数据
+	readDone := make(chan bool)
+	numReadWorkers := 2 // 使用2个读取线程
+
+	for i := 0; i < numReadWorkers; i++ {
+		go func(readWorkerID int) {
+			defer func() {
+				if readWorkerID == 0 {
+					readDone <- true
+				}
+			}()
+
+			// 每个读取线程处理自己的批次
+			readBatch := make([]ReadPair, 0, batchSize)
+
+			for {
+				// 读取1M reads或直到文件结束
+				for j := 0; j < batchSize; j++ {
+					if !scanner1.Next() || !scanner2.Next() {
+						break
+					}
+
+					seq1 := scanner1.Seq()
+					seq2 := scanner2.Seq()
+
+					readBatch = append(readBatch, ReadPair{
+						Seq1: seq1,
+						Seq2: seq2,
+					})
+
+					atomic.AddInt64(&totalReads, 1)
+				}
+
+				// 如果没有读取到数据，退出
+				if len(readBatch) == 0 {
+					break
+				}
+
+				fmt.Printf("Read worker %d: read %d reads, Total: %d\n", readWorkerID, len(readBatch), totalReads)
+
+				// 处理读取的批次 - 使用多个worker并行处理
+				results := make([]*ProcessResult, len(readBatch))
+				var wg sync.WaitGroup
+
+				// 将批次分成多个子批次给worker处理
+				subBatchSize := len(readBatch) / numWorkers
+				if subBatchSize == 0 {
+					subBatchSize = 1
+				}
+
+				for j := 0; j < numWorkers; j++ {
+					wg.Add(1)
+					go func(workerID int) {
+						defer wg.Done()
+
+						start := workerID * subBatchSize
+						end := start + subBatchSize
+						if workerID == numWorkers-1 {
+							end = len(readBatch) // 最后一个worker处理剩余的所有
+						}
+
+						for k := start; k < end; k++ {
+							result := processReadPair(readBatch[k].Seq1, readBatch[k].Seq2, pattern, keepEveryN, &patternReadsInt, &mu)
+							results[k] = result
+						}
+					}(j)
+				}
+
+				// 等待所有worker完成
+				wg.Wait()
+
+				// 将处理结果放入缓存池队列
+				for _, result := range results {
+					resultQueue <- result
+				}
+
+				fmt.Printf("Read worker %d: processed and queued %d results\n", readWorkerID, len(results))
+
+				// 清空读取批次
+				readBatch = readBatch[:0]
+
+				// 如果读取的数据少于批次大小，说明文件结束了
+				if len(readBatch) < batchSize {
+					break
+				}
+			}
+		}(i)
+	}
+
+	// 等待所有读取线程完成
+	<-readDone
+
+	// 发送结束信号给输出线程
+	resultQueue <- nil
+
+	// 等待输出完成
+	<-outputDone
+
+	// 强制刷新缓冲区
+	fmt.Println("Flushing all buffers...")
+	if err := bufferedW1.Flush(); err != nil {
+		fmt.Printf("Error flushing bufferedW1: %v\n", err)
+	}
+	if err := bufferedW2.Flush(); err != nil {
+		fmt.Printf("Error flushing bufferedW2: %v\n", err)
+	}
+
+	// 检查错误
+	if err := scanner1.Error(); err != nil {
+		return fmt.Errorf("error reading fq1: %v", err)
+	}
+	if err := scanner2.Error(); err != nil {
+		return fmt.Errorf("error reading fq2: %v", err)
+	}
+
+	// 计算最终比例
+	finalRatio := 0.0
+	if totalReads > 0 {
+		finalRatio = float64(keptPatternReads) / float64(totalReads) * 100.0
+	}
+
+	// 输出统计信息
+	statsFile := filepath.Join(outdir, basename2+".stats.txt")
+	statsContent := fmt.Sprintf("Total reads: %d\nOriginal pattern reads: %d\nKept pattern reads: %d\nTotal output reads: %d\nFinal ratio: %.2f%%\n",
+		totalReads, patternReads, keptPatternReads, totalOutputReads, finalRatio)
+
+	if err := os.WriteFile(statsFile, []byte(statsContent), 0644); err != nil {
+		return fmt.Errorf("failed to write stats file: %v", err)
+	}
+
+	// 输出最终结果
+	fmt.Printf("\nOptimized pipeline mode completed. Results saved to: %s\n", statsFile)
+	fmt.Printf("Filtered files saved to: %s and %s\n", outFile1Path, outFile2Path)
+	fmt.Printf("Total reads: %d, Kept pattern reads: %d, Total output reads: %d, Final ratio: %.2f%%\n",
+		totalReads, keptPatternReads, totalOutputReads, finalRatio)
+
+	// 如果指定了pigz路径，进行压缩
+	if pigzPath != "" {
+		if err := compressWithPigz(outFile1Path, outFile2Path, pigzPath, numWorkers); err != nil {
+			return fmt.Errorf("failed to compress output files: %v", err)
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	// 定义命令行参数
 	var fq1, fq2, pattern, outdir, pigzPath string
@@ -1198,8 +1444,8 @@ func main() {
 		usage()
 	}
 
-	// 执行过滤模式
-	err := simplePipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
+	// 执行优化流水线模式
+	err := optimizedPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 	}
