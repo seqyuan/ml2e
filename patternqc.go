@@ -31,7 +31,7 @@ type ProcessResult struct {
 	Keep       bool
 }
 
-// 线程安全的顺序队列 - 内存优化版本
+// 线程安全的顺序队列 - 高性能版本
 type OrderedQueue struct {
 	mu           sync.Mutex
 	results      map[int]*ProcessResult
@@ -46,13 +46,13 @@ func NewOrderedQueue() *OrderedQueue {
 		results:      make(map[int]*ProcessResult),
 		nextIndex:    0,
 		closed:       false,
-		maxQueueSize: 2000000, // 增加到200万个结果，大幅提高并发性能
+		maxQueueSize: 5000000, // 增加到500万个结果，大幅提高并发性能
 	}
 	q.cond = sync.NewCond(&q.mu)
 	return q
 }
 
-// 添加结果到队列 - 添加内存控制
+// 添加结果到队列 - 无阻塞版本
 func (q *OrderedQueue) Add(result *ProcessResult) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -61,20 +61,12 @@ func (q *OrderedQueue) Add(result *ProcessResult) {
 		return
 	}
 
-	// 如果队列太大，等待处理
-	for len(q.results) >= q.maxQueueSize {
-		fmt.Printf("Warning: Queue full (%d), waiting for processing...\n", len(q.results))
-		q.cond.Wait()
-		if q.closed {
-			return
-		}
-	}
-
+	// 移除队列大小限制，让worker完全不被阻塞
 	q.results[result.Index] = result
 	q.cond.Signal()
 }
 
-// 获取下一个可输出的结果
+// 获取下一个可输出的结果 - 优化版本
 func (q *OrderedQueue) GetNext() *ProcessResult {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -83,8 +75,6 @@ func (q *OrderedQueue) GetNext() *ProcessResult {
 		if result, exists := q.results[q.nextIndex]; exists {
 			delete(q.results, q.nextIndex)
 			q.nextIndex++
-			// 通知等待的Add操作
-			q.cond.Signal()
 			return result
 		}
 
@@ -93,7 +83,7 @@ func (q *OrderedQueue) GetNext() *ProcessResult {
 			return nil // 表示结束
 		}
 
-		// 添加超时等待，避免无限等待
+		// 使用更短的超时时间，减少阻塞
 		done := make(chan struct{})
 		go func() {
 			q.cond.Wait()
@@ -103,7 +93,7 @@ func (q *OrderedQueue) GetNext() *ProcessResult {
 		select {
 		case <-done:
 			// 继续循环
-		case <-time.After(5 * time.Second):
+		case <-time.After(100 * time.Microsecond): // 减少到100微秒
 			// 超时，检查是否有数据丢失
 			if len(q.results) > 0 {
 				// 找到最小的index
@@ -165,26 +155,26 @@ func (q *OrderedQueue) GetStatus() (int, int, int) {
 	return len(q.results), q.nextIndex, maxIndex
 }
 
-// 强制清理队列中的旧数据
+// 强制清理队列中的旧数据 - 优化版本
 func (q *OrderedQueue) Cleanup() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	// 只在队列过大时才清理
-	if len(q.results) > q.maxQueueSize*9/10 { // 超过90%时才清理
+	if len(q.results) > q.maxQueueSize*95/100 { // 超过95%时才清理
 		// 找到需要清理的索引范围
 		toDelete := make([]int, 0)
 		for idx := range q.results {
-			if idx < q.nextIndex-q.maxQueueSize/10 { // 只清理最旧的10%
+			if idx < q.nextIndex-q.maxQueueSize/20 { // 只清理最旧的5%
 				toDelete = append(toDelete, idx)
 			}
 		}
-		
+
 		// 删除旧数据
 		for _, idx := range toDelete {
 			delete(q.results, idx)
 		}
-		
+
 		if len(toDelete) > 0 {
 			fmt.Printf("Cleaned up %d old results from queue (queue size: %d)\n", len(toDelete), len(q.results))
 		}
@@ -354,12 +344,12 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 	// 计算保留的pattern reads数量
 	keepEveryN := 100 / percent
 
-	// 创建worker池 - 极大增加缓冲区大小
+	// 创建worker池 - 无限制缓冲区
 	workChan := make(chan struct {
 		seq1  fastq.Sequence
 		seq2  fastq.Sequence
 		index int
-	}, numWorkers*100) // 极大增加缓冲区，确保worker完全不被阻塞
+	}, numWorkers*1000) // 极大增加缓冲区，确保worker完全不被阻塞
 
 	// 启动worker goroutines
 	for i := 0; i < numWorkers; i++ {
@@ -373,13 +363,13 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 		}()
 	}
 
-	// 启动输出goroutine - 内存优化版本
+	// 启动输出goroutine - 高性能版本
 	outputDone := make(chan bool)
 	go func() {
 		defer func() { outputDone <- true }()
 
-		// 批量写入以提高性能
-		batchSize := 1000
+		// 增加批量写入大小，提高I/O效率
+		batchSize := 5000 // 从1000增加到5000
 		batch := make([]*ProcessResult, 0, batchSize)
 		cleanupCounter := 0
 
@@ -400,9 +390,9 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 				writeBatch(batch, w1, w2, &keptPatternReads, &totalOutputReads, &mu)
 				batch = batch[:0] // 清空批次
 
-				// 定期清理队列内存
+				// 大幅减少清理频率
 				cleanupCounter++
-				if cleanupCounter >= 500 { // 大幅减少清理频率，让worker充分工作
+				if cleanupCounter >= 1000 { // 每1000个批次清理一次
 					queue.Cleanup()
 					cleanupCounter = 0
 				}
@@ -417,23 +407,12 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 		seq2 := scanner2.Seq()
 		totalReads++
 
-		// 发送工作到worker池
-		select {
-		case workChan <- struct {
+		// 发送工作到worker池 - 无阻塞版本
+		workChan <- struct {
 			seq1  fastq.Sequence
 			seq2  fastq.Sequence
 			index int
-		}{seq1, seq2, index}:
-			// 成功发送
-		default:
-			// 通道满了，等待一下
-			time.Sleep(time.Microsecond) // 减少等待时间到微秒级别
-			workChan <- struct {
-				seq1  fastq.Sequence
-				seq2  fastq.Sequence
-				index int
-			}{seq1, seq2, index}
-		}
+		}{seq1, seq2, index}
 
 		index++
 
