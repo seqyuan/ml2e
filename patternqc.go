@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"flag"
 	"fmt"
@@ -18,7 +19,7 @@ import (
 )
 
 const (
-	Version   = "1.0.0"
+	Version   = "3.0.0"
 	BuildTime = "2024-08-30"
 )
 
@@ -298,18 +299,18 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 			for {
 				results := queue.GetAll()
 				if results == nil {
-									// 队列已关闭，处理剩余批次
-				if len(batch) > 0 {
-					writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
+					// 队列已关闭，处理剩余批次
+					if len(batch) > 0 {
+						writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
+					}
+					break
 				}
-				break
-			}
 
-			batch = append(batch, results...)
+				batch = append(batch, results...)
 
-			// 当批次满了时写入
-			if len(batch) >= batchSize {
-				writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
+				// 当批次满了时写入
+				if len(batch) >= batchSize {
+					writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
 					batch = batch[:0] // 清空批次
 
 					if outputWorkerID == 0 {
@@ -542,12 +543,12 @@ func writeBatchSeparate(batch []*ProcessResult, w1, w2 fastq.Writer, keptPattern
 
 // 高性能缓冲写入器
 type BufferedFastqWriter struct {
-	mu       sync.Mutex
-	buffer   []byte
-	writer   fastq.Writer
-	file     *os.File
-	maxSize  int
-	written  int64
+	mu      sync.Mutex
+	buffer  []byte
+	writer  fastq.Writer
+	file    *os.File
+	maxSize int
+	written int64
 }
 
 func NewBufferedFastqWriter(writer fastq.Writer, file *os.File, bufferSize int) *BufferedFastqWriter {
@@ -562,19 +563,19 @@ func NewBufferedFastqWriter(writer fastq.Writer, file *os.File, bufferSize int) 
 func (bfw *BufferedFastqWriter) Write(seq fastq.Sequence) error {
 	bfw.mu.Lock()
 	defer bfw.mu.Unlock()
-	
+
 	// 直接使用fastq.Writer，它已经处理了序列化
 	if _, err := bfw.writer.Write(seq); err != nil {
 		return err
 	}
-	
+
 	bfw.written++
-	
+
 	// 定期刷新缓冲区
 	if bfw.written%10000 == 0 {
 		return bfw.flush()
 	}
-	
+
 	return nil
 }
 
@@ -600,19 +601,19 @@ func (bfw *BufferedFastqWriter) Close() error {
 func writeBatchOptimized(batch []*ProcessResult, w1, w2 *BufferedFastqWriter, keptPatternReads *int, totalOutputReads *int, mu *sync.Mutex) {
 	// 分离R1和R2的数据
 	var r1Data, r2Data []fastq.Sequence
-	
+
 	for _, result := range batch {
 		if result.Keep {
 			r1Data = append(r1Data, result.Seq1)
 			r2Data = append(r2Data, result.Seq2)
 		}
 	}
-	
+
 	// 使用goroutine并行写入两个文件
 	var wg sync.WaitGroup
 	var r1Err, r2Err error
 	wg.Add(2)
-	
+
 	// 写入R1文件
 	go func() {
 		defer wg.Done()
@@ -624,7 +625,7 @@ func writeBatchOptimized(batch []*ProcessResult, w1, w2 *BufferedFastqWriter, ke
 			}
 		}
 	}()
-	
+
 	// 写入R2文件
 	go func() {
 		defer wg.Done()
@@ -636,16 +637,16 @@ func writeBatchOptimized(batch []*ProcessResult, w1, w2 *BufferedFastqWriter, ke
 			}
 		}
 	}()
-	
+
 	// 等待两个写入完成
 	wg.Wait()
-	
+
 	// 检查错误
 	if r1Err != nil || r2Err != nil {
 		log.Printf("Write errors - R1: %v, R2: %v", r1Err, r2Err)
 		return
 	}
-	
+
 	// 统计输出
 	mu.Lock()
 	*totalOutputReads += len(r1Data)
@@ -655,6 +656,170 @@ func writeBatchOptimized(batch []*ProcessResult, w1, w2 *BufferedFastqWriter, ke
 		}
 	}
 	mu.Unlock()
+}
+
+// 借鉴fastp的内存池
+type MemoryPool struct {
+	pool sync.Pool
+	size int
+}
+
+func NewMemoryPool(size int) *MemoryPool {
+	return &MemoryPool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 0, size)
+			},
+		},
+		size: size,
+	}
+}
+
+func (mp *MemoryPool) Get() []byte {
+	return mp.pool.Get().([]byte)
+}
+
+func (mp *MemoryPool) Put(buf []byte) {
+	// 重置缓冲区
+	buf = buf[:0]
+	mp.pool.Put(buf)
+}
+
+// 借鉴fastp的线程池设计
+type ThreadPool struct {
+	workers    int
+	taskQueue  chan interface{}
+	workerFunc func(interface{})
+	wg         sync.WaitGroup
+}
+
+func NewThreadPool(workers int, workerFunc func(interface{})) *ThreadPool {
+	tp := &ThreadPool{
+		workers:    workers,
+		taskQueue:  make(chan interface{}, workers*100),
+		workerFunc: workerFunc,
+	}
+
+	for i := 0; i < workers; i++ {
+		tp.wg.Add(1)
+		go tp.worker()
+	}
+
+	return tp
+}
+
+func (tp *ThreadPool) worker() {
+	defer tp.wg.Done()
+	for task := range tp.taskQueue {
+		tp.workerFunc(task)
+	}
+}
+
+func (tp *ThreadPool) Submit(task interface{}) {
+	tp.taskQueue <- task
+}
+
+func (tp *ThreadPool) Close() {
+	close(tp.taskQueue)
+	tp.wg.Wait()
+}
+
+// 借鉴fastp的智能写入器
+type SmartFastqWriter struct {
+	mu         sync.Mutex
+	buffers    map[string]*bytes.Buffer
+	writers    map[string]*BufferedFastqWriter
+	batchSize  int
+	flushTimer *time.Timer
+	memoryPool *MemoryPool
+}
+
+func NewSmartFastqWriter(w1, w2 *BufferedFastqWriter, batchSize int) *SmartFastqWriter {
+	sfw := &SmartFastqWriter{
+		buffers: map[string]*bytes.Buffer{
+			"R1": bytes.NewBuffer(make([]byte, 0, batchSize)),
+			"R2": bytes.NewBuffer(make([]byte, 0, batchSize)),
+		},
+		writers: map[string]*BufferedFastqWriter{
+			"R1": w1,
+			"R2": w2,
+		},
+		batchSize:  batchSize,
+		memoryPool: NewMemoryPool(batchSize),
+	}
+
+	// 设置定时刷新
+	sfw.flushTimer = time.AfterFunc(100*time.Millisecond, func() {
+		sfw.FlushAll()
+	})
+
+	return sfw
+}
+
+func (sfw *SmartFastqWriter) Write(fileType string, seq fastq.Sequence) error {
+	sfw.mu.Lock()
+	defer sfw.mu.Unlock()
+
+	buffer := sfw.buffers[fileType]
+
+	// 序列化序列
+	serialized := sfw.serializeSequence(seq)
+	buffer.Write(serialized)
+
+	// 检查是否需要刷新
+	if buffer.Len() >= sfw.batchSize {
+		return sfw.flushFile(fileType)
+	}
+
+	return nil
+}
+
+func (sfw *SmartFastqWriter) flushFile(fileType string) error {
+	buffer := sfw.buffers[fileType]
+	writer := sfw.writers[fileType]
+
+	if buffer.Len() == 0 {
+		return nil
+	}
+
+	// 直接写入文件，绕过fastq.Writer
+	data := buffer.Bytes()
+	_, err := writer.file.Write(data)
+	if err != nil {
+		return err
+	}
+
+	// 重置缓冲区
+	buffer.Reset()
+
+	return nil
+}
+
+func (sfw *SmartFastqWriter) FlushAll() error {
+	sfw.mu.Lock()
+	defer sfw.mu.Unlock()
+
+	for fileType := range sfw.buffers {
+		if err := sfw.flushFile(fileType); err != nil {
+			return err
+		}
+	}
+
+	// 重置定时器
+	sfw.flushTimer.Reset(100 * time.Millisecond)
+
+	return nil
+}
+
+func (sfw *SmartFastqWriter) serializeSequence(seq fastq.Sequence) []byte {
+	// 使用内存池获取缓冲区
+	buf := sfw.memoryPool.Get()
+	defer sfw.memoryPool.Put(buf)
+
+	// 序列化逻辑
+	// ... 实现序列化
+
+	return buf
 }
 
 func usage() {
