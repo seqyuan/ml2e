@@ -246,8 +246,8 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 	w2 := fastq.NewWriter(writer2)
 
 	// 创建高性能缓冲写入器
-	bufferedW1 := NewBufferedFastqWriter(w1, outFile1, 1024*1024) // 1MB缓冲区
-	bufferedW2 := NewBufferedFastqWriter(w2, outFile2, 1024*1024) // 1MB缓冲区
+	bufferedW1 := NewBufferedFastqWriter(w1, outFile1, 4*1024*1024) // 增加到4MB缓冲区
+	bufferedW2 := NewBufferedFastqWriter(w2, outFile2, 4*1024*1024) // 增加到4MB缓冲区
 	defer bufferedW1.Close()
 	defer bufferedW2.Close()
 
@@ -268,7 +268,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 	workChan := make(chan struct {
 		seq1 fastq.Sequence
 		seq2 fastq.Sequence
-	}, numWorkers*1000) // 极大增加缓冲区，确保worker完全不被阻塞
+	}, numWorkers*2000) // 进一步增加缓冲区，确保worker完全不被阻塞
 
 	// 启动worker goroutines - 高性能版本
 	for i := 0; i < numWorkers; i++ {
@@ -292,7 +292,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 
 	// 启动多个输出goroutine - 真正的多线程输出
 	outputDone := make(chan bool)
-	numOutputWorkers := 4 // 使用4个输出线程
+	numOutputWorkers := numWorkers // 使用与worker数量相同的输出线程
 
 	for i := 0; i < numOutputWorkers; i++ {
 		go func(outputWorkerID int) {
@@ -303,7 +303,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 			}()
 
 			// 每个输出线程处理自己的批次
-			batchSize := 250000 // 每个线程25万个结果
+			batchSize := 500000 // 增加到50万个结果
 			batch := make([]*ProcessResult, 0, batchSize)
 
 			for {
@@ -366,12 +366,11 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 			fmt.Printf("Processed %d reads, Queue: %d, Memory: %.2f GB\n",
 				totalReads, queueLen, float64(m.Alloc)/1024/1024/1024)
 
-			// 如果内存使用过高，强制垃圾回收（调整到48GB）
-			if m.Alloc > 48*1024*1024*1024 { // 超过48GB
+			// 如果内存使用过高，强制垃圾回收（调整到50GB）
+			if m.Alloc > 50*1024*1024*1024 { // 超过50GB
 				fmt.Printf("High memory usage detected (%.2f GB), forcing garbage collection...\n",
 					float64(m.Alloc)/1024/1024/1024)
 				runtime.GC()
-				// queue.Cleanup() // 移除旧的清理逻辑
 			}
 		}
 	}
