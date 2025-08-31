@@ -16,11 +16,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/edsrzf/mmap-go"
 	"github.com/seqyuan/annogene/io/fastq"
 )
 
 const (
-	Version   = "4.0.1"
+	Version   = "5.1.0"
 	BuildTime = "2024-12-19"
 )
 
@@ -1230,6 +1231,427 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 	return nil
 }
 
+// 内存映射的FastqReader
+type MmapFastqReader struct {
+	file      *os.File
+	data      mmap.MMap
+	scanner   *fastq.Scanner
+	reader    io.Reader
+	offset    int
+	chunkSize int
+	sequences []fastq.Sequence
+	index     int
+}
+
+func NewMmapFastqReader(filePath string, chunkSize int) (*MmapFastqReader, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	var reader io.Reader = file
+	var data mmap.MMap
+
+	// 检查文件大小（用于调试）
+	_, err = file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+
+	// 如果文件是gzip格式，使用普通读取
+	if strings.HasSuffix(filePath, ".gz") {
+		gz, err := gzip.NewReader(file)
+		if err != nil {
+			file.Close()
+			return nil, err
+		}
+		reader = gz
+	} else {
+		// 使用内存映射
+		data, err = mmap.Map(file, mmap.RDONLY, 0)
+		if err != nil {
+			file.Close()
+			return nil, err
+		}
+		reader = bytes.NewReader(data)
+	}
+
+	return &MmapFastqReader{
+		file:      file,
+		data:      data,
+		reader:    reader,
+		chunkSize: chunkSize,
+		sequences: make([]fastq.Sequence, 0, 50000), // 预分配5万容量
+		offset:    0,
+		index:     0,
+	}, nil
+}
+
+func (mfr *MmapFastqReader) Close() error {
+	if mfr.data != nil {
+		mfr.data.Unmap()
+	}
+	return mfr.file.Close()
+}
+
+func (mfr *MmapFastqReader) ReadChunk() ([]fastq.Sequence, error) {
+	// 如果当前批次还有数据，直接返回
+	if mfr.index < len(mfr.sequences) {
+		start := mfr.index
+		end := len(mfr.sequences)
+		mfr.index = end
+		return mfr.sequences[start:end], nil
+	}
+
+	// 如果使用内存映射
+	if mfr.data != nil {
+		end := mfr.offset + mfr.chunkSize
+		if end > len(mfr.data) {
+			end = len(mfr.data)
+		}
+
+		if mfr.offset >= len(mfr.data) {
+			return nil, io.EOF
+		}
+
+		// 创建scanner处理这个块
+		reader := bytes.NewReader(mfr.data[mfr.offset:end])
+		scanner := fastq.NewScanner(fastq.NewReader(reader))
+
+		// 清空之前的序列
+		mfr.sequences = mfr.sequences[:0]
+		mfr.index = 0
+
+		// 解析FASTQ记录
+		for scanner.Next() {
+			mfr.sequences = append(mfr.sequences, scanner.Seq())
+		}
+
+		if err := scanner.Error(); err != nil {
+			return nil, err
+		}
+
+		mfr.offset = end
+		return mfr.sequences, nil
+	}
+
+	// 如果使用普通读取（gzip文件）
+	buffer := make([]byte, mfr.chunkSize)
+	n, err := mfr.reader.Read(buffer)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, io.EOF
+	}
+
+	// 创建scanner处理这个块
+	reader := bytes.NewReader(buffer[:n])
+	scanner := fastq.NewScanner(fastq.NewReader(reader))
+
+	// 清空之前的序列
+	mfr.sequences = mfr.sequences[:0]
+	mfr.index = 0
+
+	// 解析FASTQ记录
+	for scanner.Next() {
+		mfr.sequences = append(mfr.sequences, scanner.Seq())
+	}
+
+	if err := scanner.Error(); err != nil {
+		return nil, err
+	}
+
+	return mfr.sequences, nil
+}
+
+// 内存映射高性能流水线模式
+func mmapPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, pigzPath string) error {
+	// 创建输出目录
+	if err := os.MkdirAll(outdir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %v", err)
+	}
+
+	// 创建内存映射读取器，5MB缓冲区
+	chunkSize := 5 * 1024 * 1024 // 5MB块
+	reader1, err := NewMmapFastqReader(fq1, chunkSize)
+	if err != nil {
+		return err
+	}
+	defer reader1.Close()
+
+	reader2, err := NewMmapFastqReader(fq2, chunkSize)
+	if err != nil {
+		return err
+	}
+	defer reader2.Close()
+
+	// 创建输出文件
+	basename1 := getBasename(fq1)
+	basename2 := getBasename(fq2)
+	outFile1Path := filepath.Join(outdir, basename1)
+	outFile2Path := filepath.Join(outdir, basename2)
+
+	writer1, outFile1, err := createWriter(outFile1Path)
+	if err != nil {
+		return err
+	}
+	defer outFile1.Close()
+
+	writer2, outFile2, err := createWriter(outFile2Path)
+	if err != nil {
+		return err
+	}
+	defer outFile2.Close()
+
+	// 创建fastq writer
+	w1 := fastq.NewWriter(writer1)
+	w2 := fastq.NewWriter(writer2)
+
+	// 创建高性能缓冲写入器，增加缓冲区大小
+	bufferedW1 := NewBufferedFastqWriter(w1, outFile1, 16*1024*1024) // 16MB缓冲区
+	bufferedW2 := NewBufferedFastqWriter(w2, outFile2, 16*1024*1024) // 16MB缓冲区
+	defer bufferedW1.Close()
+	defer bufferedW2.Close()
+
+	// 统计变量
+	var totalReads, patternReads int64
+	var keptPatternReads, totalOutputReads int
+	var patternReadsInt int
+	var mu sync.Mutex
+
+	// 计算保留的pattern reads数量
+	keepEveryN := 100 / percent
+
+	// 创建写入缓存池，增加容量
+	writeCache := make(chan *ProcessResult, 20000000) // 20M容量
+	defer close(writeCache)
+
+	// 创建读取队列，增加容量
+	readQueue := make(chan ReadPair, 500000) // 50万容量
+	defer close(readQueue)
+
+	// 创建控制通道
+	stopReading := make(chan bool)
+	stopProcessing := make(chan bool)
+	stopWriting := make(chan bool)
+	r1BatchReady := make(chan []fastq.Sequence, 20) // 增加缓冲区
+
+	// 启动多个读取线程（4个线程）
+	numReadThreads := 4
+	readDone := make(chan bool, numReadThreads)
+
+	for threadID := 0; threadID < numReadThreads; threadID++ {
+		go func(threadID int) {
+			defer func() {
+				readDone <- true
+			}()
+
+			for {
+				// 读取R1块
+				r1Sequences, err := reader1.ReadChunk()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					log.Printf("Error reading R1 chunk in thread %d: %v", threadID, err)
+					break
+				}
+
+				// 读取R2块
+				r2Sequences, err := reader2.ReadChunk()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					log.Printf("Error reading R2 chunk in thread %d: %v", threadID, err)
+					break
+				}
+
+				// 处理这个块中的reads
+				minLen := len(r1Sequences)
+				if len(r2Sequences) < minLen {
+					minLen = len(r2Sequences)
+				}
+
+				for i := 0; i < minLen; i++ {
+					select {
+					case readQueue <- ReadPair{Seq1: r1Sequences[i], Seq2: r2Sequences[i]}:
+						currentReads := atomic.AddInt64(&totalReads, 1)
+
+						// 每读取2M reads输出进度
+						if currentReads%2000000 == 0 {
+							fmt.Printf("Read %d reads (mmap mode, thread %d)\n", currentReads, threadID)
+						}
+					case <-stopReading:
+						return
+					}
+				}
+			}
+		}(threadID)
+	}
+
+	// 启动worker线程池
+	workerDone := make(chan bool)
+	for i := 0; i < numWorkers; i++ {
+		go func(workerID int) {
+			defer func() {
+				if workerID == 0 {
+					workerDone <- true
+				}
+			}()
+
+			for readPair := range readQueue {
+				result := processReadPair(readPair.Seq1, readPair.Seq2, pattern, keepEveryN, &patternReadsInt, &mu)
+
+				if result.Keep {
+					select {
+					case writeCache <- result:
+					case <-stopProcessing:
+						return
+					}
+				}
+			}
+		}(i)
+	}
+
+	// 启动输出线程
+	r1WriteDone := make(chan bool)
+	go func() {
+		defer func() {
+			r1WriteDone <- true
+		}()
+
+		batch := make([]fastq.Sequence, 0, 1000)
+
+		for {
+			select {
+			case result := <-writeCache:
+				if result == nil {
+					if len(batch) > 0 {
+						writeR1Batch(batch, bufferedW1)
+					}
+					return
+				}
+
+				batch = append(batch, result.Seq1)
+
+				if len(batch) >= 1000 {
+					select {
+					case r1BatchReady <- batch:
+						batch = make([]fastq.Sequence, 0, 1000)
+					case <-stopWriting:
+						return
+					}
+				}
+			case <-stopWriting:
+				return
+			}
+		}
+	}()
+
+	r2WriteDone := make(chan bool)
+	go func() {
+		defer func() {
+			r2WriteDone <- true
+		}()
+
+		batch := make([]fastq.Sequence, 0, 1000)
+
+		for {
+			select {
+			case result := <-writeCache:
+				if result == nil {
+					if len(batch) > 0 {
+						writeR2Batch(batch, bufferedW2)
+					}
+					return
+				}
+
+				batch = append(batch, result.Seq2)
+
+				if len(batch) >= 1000 {
+					select {
+					case r1Batch := <-r1BatchReady:
+						writeR1Batch(r1Batch, bufferedW1)
+						writeR2Batch(batch, bufferedW2)
+
+						mu.Lock()
+						totalOutputReads += len(batch)
+						for _, r := range r1Batch {
+							if containsPattern(string(r.Letters), pattern) {
+								keptPatternReads++
+							}
+						}
+						mu.Unlock()
+
+						batch = make([]fastq.Sequence, 0, 1000)
+					case <-stopWriting:
+						return
+					}
+				}
+			case <-stopWriting:
+				return
+			}
+		}
+	}()
+
+	// 等待所有读取线程完成
+	for i := 0; i < numReadThreads; i++ {
+		<-readDone
+	}
+	close(stopReading)
+	close(stopProcessing)
+	close(readQueue)
+
+	writeCache <- nil
+	writeCache <- nil
+
+	<-r1WriteDone
+	<-r2WriteDone
+	close(stopWriting)
+
+	// 强制刷新缓冲区
+	fmt.Println("Flushing all buffers...")
+	if err := bufferedW1.Flush(); err != nil {
+		fmt.Printf("Error flushing bufferedW1: %v\n", err)
+	}
+	if err := bufferedW2.Flush(); err != nil {
+		fmt.Printf("Error flushing bufferedW2: %v\n", err)
+	}
+
+	// 计算最终比例
+	finalRatio := 0.0
+	if totalReads > 0 {
+		finalRatio = float64(keptPatternReads) / float64(totalReads) * 100.0
+	}
+
+	// 输出统计信息
+	statsFile := filepath.Join(outdir, basename2+".stats.txt")
+	statsContent := fmt.Sprintf("Total reads: %d\nOriginal pattern reads: %d\nKept pattern reads: %d\nTotal output reads: %d\nFinal ratio: %.2f%%\n",
+		totalReads, patternReads, keptPatternReads, totalOutputReads, finalRatio)
+
+	if err := os.WriteFile(statsFile, []byte(statsContent), 0644); err != nil {
+		return fmt.Errorf("failed to write stats file: %v", err)
+	}
+
+	// 输出最终结果
+	fmt.Printf("\nMemory-mapped pipeline mode completed. Results saved to: %s\n", statsFile)
+	fmt.Printf("Filtered files saved to: %s and %s\n", outFile1Path, outFile2Path)
+	fmt.Printf("Total reads: %d, Kept pattern reads: %d, Total output reads: %d, Final ratio: %.2f%%\n",
+		totalReads, keptPatternReads, totalOutputReads, finalRatio)
+
+	// 如果指定了pigz路径，进行压缩
+	if pigzPath != "" {
+		if err := compressWithPigz(outFile1Path, outFile2Path, pigzPath, numWorkers); err != nil {
+			return fmt.Errorf("failed to compress output files: %v", err)
+		}
+	}
+
+	return nil
+}
+
 // 写入R1批次
 func writeR1Batch(batch []fastq.Sequence, writer *BufferedFastqWriter) {
 	for _, seq := range batch {
@@ -1253,6 +1675,7 @@ func main() {
 	var fq1, fq2, pattern, outdir, pigzPath string
 	var percent, numWorkers int
 	var showVersion bool
+	var useMmap bool
 
 	flag.StringVar(&fq1, "fq1", "", "Input fastq file 1 (supports .gz format)")
 	flag.StringVar(&fq2, "fq2", "", "Input fastq file 2 (supports .gz format)")
@@ -1262,6 +1685,7 @@ func main() {
 	flag.IntVar(&numWorkers, "workers", 4, "Number of worker threads")
 	flag.StringVar(&pigzPath, "pigz", "", "Path to pigz executable for compression")
 	flag.BoolVar(&showVersion, "version", false, "Show version information")
+	flag.BoolVar(&useMmap, "mmap", false, "Use memory-mapped file reading for better performance")
 
 	// 解析命令行参数
 	flag.Parse()
@@ -1288,8 +1712,15 @@ func main() {
 		usage()
 	}
 
-	// 执行优化流水线模式
-	err := optimizedPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
+	// 根据参数选择执行模式
+	var err error
+	if useMmap {
+		fmt.Println("Using memory-mapped pipeline mode...")
+		err = mmapPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
+	} else {
+		fmt.Println("Using optimized pipeline mode...")
+		err = optimizedPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
+	}
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 	}
