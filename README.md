@@ -8,6 +8,7 @@
 - **压缩文件支持**：自动识别和处理 `.gz` 压缩文件
 - **Pattern 匹配**：支持正向和反向互补序列匹配
 - **灵活过滤**：可设置保留 pattern reads 的百分比
+- **高性能流水线**：使用10M reads批次处理，优化内存使用
 - **批量处理**：支持批量写入，提高 I/O 性能
 - **进度显示**：实时显示处理进度
 - **统计报告**：生成详细的处理统计信息
@@ -21,7 +22,7 @@
 go install github.com/seqyuan/patternqc/v3@latest
 
 # 安装特定版本
-go install github.com/seqyuan/patternqc/v3@v3.0.1
+go install github.com/seqyuan/patternqc/v3@v3.0.3
 ```
 
 安装后，`patternqc` 命令会被安装到 `$GOPATH/bin` 目录中，确保该目录在你的 `PATH` 环境变量中。
