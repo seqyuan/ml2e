@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	Version   = "5.1.0"
+	Version   = "5.2.0"
 	BuildTime = "2024-12-19"
 )
 
@@ -1368,26 +1368,29 @@ func (mfr *MmapFastqReader) ReadChunk() ([]fastq.Sequence, error) {
 	return mfr.sequences, nil
 }
 
-// 内存映射高性能流水线模式
-func mmapPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, pigzPath string) error {
+// 双线程并行读取模式
+func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, pigzPath string) error {
 	// 创建输出目录
 	if err := os.MkdirAll(outdir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %v", err)
 	}
 
-	// 创建内存映射读取器，5MB缓冲区
-	chunkSize := 5 * 1024 * 1024 // 5MB块
-	reader1, err := NewMmapFastqReader(fq1, chunkSize)
+	// 创建输入文件reader
+	reader1, file1, err := createReader(fq1)
 	if err != nil {
 		return err
 	}
-	defer reader1.Close()
+	defer file1.Close()
 
-	reader2, err := NewMmapFastqReader(fq2, chunkSize)
+	reader2, file2, err := createReader(fq2)
 	if err != nil {
 		return err
 	}
-	defer reader2.Close()
+	defer file2.Close()
+
+	// 创建fastq scanner
+	scanner1 := fastq.NewScanner(fastq.NewReader(reader1))
+	scanner2 := fastq.NewScanner(fastq.NewReader(reader2))
 
 	// 创建输出文件
 	basename1 := getBasename(fq1)
@@ -1428,71 +1431,124 @@ func mmapPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 
 	// 创建写入缓存池，增加容量
 	writeCache := make(chan *ProcessResult, 20000000) // 20M容量
-	defer close(writeCache)
 
 	// 创建读取队列，增加容量
 	readQueue := make(chan ReadPair, 500000) // 50万容量
-	defer close(readQueue)
 
 	// 创建控制通道
 	stopReading := make(chan bool)
 	stopProcessing := make(chan bool)
 	stopWriting := make(chan bool)
+
 	r1BatchReady := make(chan []fastq.Sequence, 20) // 增加缓冲区
 
-	// 启动多个读取线程（4个线程）
-	numReadThreads := 4
-	readDone := make(chan bool, numReadThreads)
+	// 批量读取配置
+	const batchSize = 10000 // 1万条reads一批
+	r1BatchQueue := make(chan []fastq.Sequence, 10)
+	r2BatchQueue := make(chan []fastq.Sequence, 10)
 
-	for threadID := 0; threadID < numReadThreads; threadID++ {
-		go func(threadID int) {
-			defer func() {
-				readDone <- true
-			}()
+	// 启动R1批量读取线程
+	r1Done := make(chan bool)
+	go func() {
+		defer func() {
+			r1Done <- true
+		}()
 
-			for {
-				// 读取R1块
-				r1Sequences, err := reader1.ReadChunk()
-				if err == io.EOF {
-					break
+		batch := make([]fastq.Sequence, 0, batchSize)
+		for scanner1.Next() {
+			batch = append(batch, scanner1.Seq())
+			if len(batch) >= batchSize {
+				select {
+				case r1BatchQueue <- batch:
+					batch = make([]fastq.Sequence, 0, batchSize)
+				case <-stopReading:
+					return
 				}
-				if err != nil {
-					log.Printf("Error reading R1 chunk in thread %d: %v", threadID, err)
-					break
+			}
+		}
+		// 发送最后一批
+		if len(batch) > 0 {
+			select {
+			case r1BatchQueue <- batch:
+			case <-stopReading:
+				return
+			}
+		}
+		close(r1BatchQueue)
+	}()
+
+	// 启动R2批量读取线程
+	r2Done := make(chan bool)
+	go func() {
+		defer func() {
+			r2Done <- true
+		}()
+
+		batch := make([]fastq.Sequence, 0, batchSize)
+		for scanner2.Next() {
+			batch = append(batch, scanner2.Seq())
+			if len(batch) >= batchSize {
+				select {
+				case r2BatchQueue <- batch:
+					batch = make([]fastq.Sequence, 0, batchSize)
+				case <-stopReading:
+					return
+				}
+			}
+		}
+		// 发送最后一批
+		if len(batch) > 0 {
+			select {
+			case r2BatchQueue <- batch:
+			case <-stopReading:
+				return
+			}
+		}
+		close(r2BatchQueue)
+	}()
+
+	// 启动批量配对线程
+	pairDone := make(chan bool)
+	go func() {
+		defer func() {
+			pairDone <- true
+		}()
+
+		for {
+			select {
+			case r1Batch, ok1 := <-r1BatchQueue:
+				if !ok1 {
+					return
+				}
+				r2Batch, ok2 := <-r2BatchQueue
+				if !ok2 {
+					return
 				}
 
-				// 读取R2块
-				r2Sequences, err := reader2.ReadChunk()
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					log.Printf("Error reading R2 chunk in thread %d: %v", threadID, err)
-					break
-				}
-
-				// 处理这个块中的reads
-				minLen := len(r1Sequences)
-				if len(r2Sequences) < minLen {
-					minLen = len(r2Sequences)
+				// 批量配对
+				minLen := len(r1Batch)
+				if len(r2Batch) < minLen {
+					minLen = len(r2Batch)
 				}
 
 				for i := 0; i < minLen; i++ {
 					select {
-					case readQueue <- ReadPair{Seq1: r1Sequences[i], Seq2: r2Sequences[i]}:
+					case readQueue <- ReadPair{Seq1: r1Batch[i], Seq2: r2Batch[i]}:
 						currentReads := atomic.AddInt64(&totalReads, 1)
 
 						// 每读取2M reads输出进度
 						if currentReads%2000000 == 0 {
-							fmt.Printf("Read %d reads (mmap mode, thread %d)\n", currentReads, threadID)
+							fmt.Printf("Read %d reads (batch mode)\n", currentReads)
 						}
 					case <-stopReading:
 						return
 					}
 				}
+			case <-stopReading:
+				return
 			}
-		}(threadID)
-	}
+		}
+	}()
 
 	// 启动worker线程池
 	workerDone := make(chan bool)
@@ -1599,20 +1655,25 @@ func mmapPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 		}
 	}()
 
-	// 等待所有读取线程完成
-	for i := 0; i < numReadThreads; i++ {
-		<-readDone
-	}
+	// 等待R1、R2读取线程和配对线程完成
+	<-r1Done
+	<-r2Done
+	<-pairDone
 	close(stopReading)
 	close(stopProcessing)
 	close(readQueue)
 
+	// 发送结束信号给输出线程
 	writeCache <- nil
 	writeCache <- nil
 
+	// 等待输出线程完成
 	<-r1WriteDone
 	<-r2WriteDone
 	close(stopWriting)
+
+	// 关闭通道
+	close(writeCache)
 
 	// 强制刷新缓冲区
 	fmt.Println("Flushing all buffers...")
@@ -1639,7 +1700,7 @@ func mmapPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 	}
 
 	// 输出最终结果
-	fmt.Printf("\nMemory-mapped pipeline mode completed. Results saved to: %s\n", statsFile)
+	fmt.Printf("\nDual thread pipeline mode completed. Results saved to: %s\n", statsFile)
 	fmt.Printf("Filtered files saved to: %s and %s\n", outFile1Path, outFile2Path)
 	fmt.Printf("Total reads: %d, Kept pattern reads: %d, Total output reads: %d, Final ratio: %.2f%%\n",
 		totalReads, keptPatternReads, totalOutputReads, finalRatio)
@@ -1717,8 +1778,8 @@ func main() {
 	// 根据参数选择执行模式
 	var err error
 	if useMmap {
-		fmt.Println("Using memory-mapped pipeline mode...")
-		err = mmapPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
+		fmt.Println("Using dual thread pipeline mode...")
+		err = dualThreadPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
 	} else {
 		fmt.Println("Using optimized pipeline mode...")
 		err = optimizedPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
