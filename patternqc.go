@@ -351,16 +351,24 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 		index int
 	}, numWorkers*1000) // 极大增加缓冲区，确保worker完全不被阻塞
 
-	// 启动worker goroutines
+	// 启动worker goroutines - 高性能版本
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
+			processedCount := 0
 			for work := range workChan {
 				result := processReadPair(work.seq1, work.seq2, work.index, pattern, keepEveryN, &patternReads, &mu)
 				queue.Add(result)
+				processedCount++
+				
+				// 每处理10000个reads输出一次worker状态
+				if processedCount%10000 == 0 {
+					fmt.Printf("Worker %d processed %d reads\n", workerID, processedCount)
+				}
 			}
-		}()
+			fmt.Printf("Worker %d finished, total processed: %d\n", workerID, processedCount)
+		}(i)
 	}
 
 	// 启动输出goroutine - 高性能版本
@@ -369,7 +377,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 		defer func() { outputDone <- true }()
 
 		// 增加批量写入大小，提高I/O效率
-		batchSize := 5000 // 从1000增加到5000
+		batchSize := 50000 // 从5000大幅增加到50000
 		batch := make([]*ProcessResult, 0, batchSize)
 		cleanupCounter := 0
 
@@ -400,8 +408,9 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 		}
 	}()
 
-	// 读取并分发工作
+	// 读取并分发工作 - 高性能版本
 	index := 0
+	
 	for scanner1.Next() && scanner2.Next() {
 		seq1 := scanner1.Seq()
 		seq2 := scanner2.Seq()
