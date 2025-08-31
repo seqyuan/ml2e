@@ -134,6 +134,42 @@ func getBasename(filePath string) string {
 	return filename
 }
 
+// 验证文件完整性
+func validateFile(filePath string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open file %s: %v", filePath, err)
+	}
+	defer file.Close()
+
+	// 检查是否为gz文件
+	if strings.HasSuffix(filePath, ".gz") {
+		// 验证gzip文件完整性
+		gz, err := gzip.NewReader(file)
+		if err != nil {
+			return fmt.Errorf("gzip file %s is corrupted or invalid: %v", filePath, err)
+		}
+		defer gz.Close()
+
+		// 尝试读取整个文件来验证完整性
+		_, err = io.Copy(io.Discard, gz)
+		if err != nil {
+			return fmt.Errorf("gzip file %s is corrupted during reading: %v", filePath, err)
+		}
+	} else {
+		// 对于普通文件，检查是否可读
+		stat, err := file.Stat()
+		if err != nil {
+			return fmt.Errorf("failed to get file info for %s: %v", filePath, err)
+		}
+		if stat.Size() == 0 {
+			return fmt.Errorf("file %s is empty", filePath)
+		}
+	}
+
+	return nil
+}
+
 // 创建reader，支持普通文件和gz文件
 func createReader(filePath string) (io.Reader, *os.File, error) {
 	file, err := os.Open(filePath)
@@ -1443,6 +1479,16 @@ func main() {
 		fmt.Println("Error: workers must be at least 1")
 		usage()
 	}
+
+	// 验证输入文件
+	fmt.Printf("Validating input files...\n")
+	if err := validateFile(fq1); err != nil {
+		log.Fatalf("Error validating fq1 (%s): %v", fq1, err)
+	}
+	if err := validateFile(fq2); err != nil {
+		log.Fatalf("Error validating fq2 (%s): %v", fq2, err)
+	}
+	fmt.Printf("Input files validation passed.\n")
 
 	// 执行优化流水线模式
 	err := optimizedPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
