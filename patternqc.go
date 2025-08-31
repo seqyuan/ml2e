@@ -32,18 +32,20 @@ type ProcessResult struct {
 
 // 线程安全的顺序队列 - 优化版本
 type OrderedQueue struct {
-	mu        sync.Mutex
-	results   map[int]*ProcessResult
-	nextIndex int
-	cond      *sync.Cond
-	closed    bool
+	mu          sync.Mutex
+	results     map[int]*ProcessResult
+	nextIndex   int
+	cond        *sync.Cond
+	closed      bool
+	workerCount int // 新增：跟踪活跃的worker数量
 }
 
 func NewOrderedQueue() *OrderedQueue {
 	q := &OrderedQueue{
-		results:   make(map[int]*ProcessResult),
-		nextIndex: 0,
-		closed:    false,
+		results:     make(map[int]*ProcessResult),
+		nextIndex:   0,
+		closed:      false,
+		workerCount: 0,
 	}
 	q.cond = sync.NewCond(&q.mu)
 	return q
@@ -79,7 +81,33 @@ func (q *OrderedQueue) GetNext() *ProcessResult {
 			return nil // 表示结束
 		}
 
-		q.cond.Wait()
+		// 添加超时等待，避免无限等待
+		done := make(chan struct{})
+		go func() {
+			q.cond.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// 继续循环
+		case <-time.After(5 * time.Second):
+			// 超时，检查是否有数据丢失
+			if len(q.results) > 0 {
+				// 找到最小的index
+				minIndex := q.nextIndex
+				for idx := range q.results {
+					if idx < minIndex {
+						minIndex = idx
+					}
+				}
+				if minIndex < q.nextIndex {
+					// 有数据丢失，调整nextIndex
+					fmt.Printf("Warning: Data gap detected, adjusting nextIndex from %d to %d\n", q.nextIndex, minIndex)
+					q.nextIndex = minIndex
+				}
+			}
+		}
 	}
 }
 
@@ -104,6 +132,25 @@ func (q *OrderedQueue) Len() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.results)
+}
+
+// 获取队列详细信息
+func (q *OrderedQueue) GetStatus() (int, int, int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	minIndex := q.nextIndex
+	maxIndex := q.nextIndex
+	for idx := range q.results {
+		if idx < minIndex {
+			minIndex = idx
+		}
+		if idx > maxIndex {
+			maxIndex = idx
+		}
+	}
+
+	return len(q.results), q.nextIndex, maxIndex
 }
 
 // 反向互补序列
@@ -264,6 +311,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 	totalReads := 0
 	patternReads := 0
 	keptPatternReads := 0
+	totalOutputReads := 0 // 新增：统计所有输出的reads
 
 	// 计算保留的pattern reads数量
 	keepEveryN := 100 / percent
@@ -301,7 +349,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 			if result == nil {
 				// 队列已关闭，处理剩余批次
 				if len(batch) > 0 {
-					writeBatch(batch, w1, w2, &keptPatternReads, &mu)
+					writeBatch(batch, w1, w2, &keptPatternReads, &totalOutputReads, &mu)
 				}
 				break
 			}
@@ -310,7 +358,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 
 			// 当批次满了时写入
 			if len(batch) >= batchSize {
-				writeBatch(batch, w1, w2, &keptPatternReads, &mu)
+				writeBatch(batch, w1, w2, &keptPatternReads, &totalOutputReads, &mu)
 				batch = batch[:0] // 清空批次
 			}
 		}
@@ -343,9 +391,11 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 
 		index++
 
-		// 每处理10000个reads输出一次进度
+		// 每处理100000个reads输出一次进度，包括队列状态
 		if totalReads%100000 == 0 {
-			fmt.Printf("Processed %d reads...\n", totalReads)
+			queueLen, nextIdx, maxIdx := queue.GetStatus()
+			fmt.Printf("Processed %d reads, Queue: %d, Next: %d, Max: %d\n",
+				totalReads, queueLen, nextIdx, maxIdx)
 		}
 	}
 
@@ -358,12 +408,23 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 	// 关闭队列
 	queue.Close()
 
-	// 等待输出完成，添加超时保护
+	// 等待输出完成，根据数据量动态调整超时时间
+	timeout := time.Duration(totalReads/1000000+1) * 60 * time.Second // 每百万reads增加1分钟
+	if timeout < 30*time.Second {
+		timeout = 30 * time.Second
+	}
+	if timeout > 600*time.Second {
+		timeout = 600 * time.Second // 最大10分钟
+	}
+
+	fmt.Printf("Waiting for output completion (timeout: %v)...\n", timeout)
 	select {
 	case <-outputDone:
-		// 正常完成
-	case <-time.After(30 * time.Second):
-		fmt.Println("Warning: Output timeout, but processing completed")
+		fmt.Println("Output completed successfully")
+	case <-time.After(timeout):
+		fmt.Printf("Warning: Output timeout after %v, but processing completed\n", timeout)
+		queueLen, nextIdx, maxIdx := queue.GetStatus()
+		fmt.Printf("Final queue status - Length: %d, Next: %d, Max: %d\n", queueLen, nextIdx, maxIdx)
 	}
 
 	if err := scanner1.Error(); err != nil {
@@ -390,12 +451,13 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 	fmt.Fprintf(output, "Total reads: %d\n", totalReads)
 	fmt.Fprintf(output, "Original pattern reads: %d\n", patternReads)
 	fmt.Fprintf(output, "Kept pattern reads: %d\n", keptPatternReads)
+	fmt.Fprintf(output, "Total output reads: %d\n", totalOutputReads) // 新增：总输出reads数
 	fmt.Fprintf(output, "Final ratio: %.2f%%\n", finalRatio)
 
 	fmt.Printf("Filter mode completed. Results saved to: %s\n", outputFile)
 	fmt.Printf("Filtered files saved to: %s and %s\n", output1, output2)
-	fmt.Printf("Total reads: %d, Kept pattern reads: %d, Final ratio: %.2f%%\n",
-		totalReads, keptPatternReads, finalRatio)
+	fmt.Printf("Total reads: %d, Kept pattern reads: %d, Total output reads: %d, Final ratio: %.2f%%\n",
+		totalReads, keptPatternReads, totalOutputReads, finalRatio)
 
 	// 如果指定了pigz路径，则压缩输出文件
 	if pigzPath != "" {
@@ -443,7 +505,7 @@ func compressFileWithPigz(filePath, pigzPath string, numWorkers int) error {
 }
 
 // 批量写入函数
-func writeBatch(batch []*ProcessResult, w1, w2 fastq.Writer, keptPatternReads *int, mu *sync.Mutex) {
+func writeBatch(batch []*ProcessResult, w1, w2 fastq.Writer, keptPatternReads *int, totalOutputReads *int, mu *sync.Mutex) {
 	for _, result := range batch {
 		if result.Keep {
 			// 写入fq1 - 确保写入完整的FASTQ记录（包括质量值）
@@ -457,11 +519,13 @@ func writeBatch(batch []*ProcessResult, w1, w2 fastq.Writer, keptPatternReads *i
 				return
 			}
 
+			// 统计所有输出的reads
+			mu.Lock()
+			*totalOutputReads++
 			if result.HasPattern {
-				mu.Lock()
 				*keptPatternReads++
-				mu.Unlock()
 			}
+			mu.Unlock()
 		}
 	}
 }
