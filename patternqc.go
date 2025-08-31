@@ -46,7 +46,7 @@ func NewOrderedQueue() *OrderedQueue {
 		results:      make(map[int]*ProcessResult),
 		nextIndex:    0,
 		closed:       false,
-		maxQueueSize: 500000, // 增加到50万个结果，充分利用多线程
+		maxQueueSize: 2000000, // 增加到200万个结果，大幅提高并发性能
 	}
 	q.cond = sync.NewCond(&q.mu)
 	return q
@@ -171,20 +171,20 @@ func (q *OrderedQueue) Cleanup() {
 	defer q.mu.Unlock()
 
 	// 只在队列过大时才清理
-	if len(q.results) > q.maxQueueSize*4/5 { // 超过80%时才清理
+	if len(q.results) > q.maxQueueSize*9/10 { // 超过90%时才清理
 		// 找到需要清理的索引范围
 		toDelete := make([]int, 0)
 		for idx := range q.results {
-			if idx < q.nextIndex-q.maxQueueSize/5 { // 只清理最旧的20%
+			if idx < q.nextIndex-q.maxQueueSize/10 { // 只清理最旧的10%
 				toDelete = append(toDelete, idx)
 			}
 		}
-
+		
 		// 删除旧数据
 		for _, idx := range toDelete {
 			delete(q.results, idx)
 		}
-
+		
 		if len(toDelete) > 0 {
 			fmt.Printf("Cleaned up %d old results from queue (queue size: %d)\n", len(toDelete), len(q.results))
 		}
@@ -354,12 +354,12 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 	// 计算保留的pattern reads数量
 	keepEveryN := 100 / percent
 
-	// 创建worker池 - 大幅增加缓冲区大小
+	// 创建worker池 - 极大增加缓冲区大小
 	workChan := make(chan struct {
 		seq1  fastq.Sequence
 		seq2  fastq.Sequence
 		index int
-	}, numWorkers*20) // 大幅增加缓冲区，确保worker不被阻塞
+	}, numWorkers*100) // 极大增加缓冲区，确保worker完全不被阻塞
 
 	// 启动worker goroutines
 	for i := 0; i < numWorkers; i++ {
@@ -402,7 +402,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 
 				// 定期清理队列内存
 				cleanupCounter++
-				if cleanupCounter >= 100 { // 进一步减少清理频率，让worker充分工作
+				if cleanupCounter >= 500 { // 大幅减少清理频率，让worker充分工作
 					queue.Cleanup()
 					cleanupCounter = 0
 				}
@@ -427,7 +427,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 			// 成功发送
 		default:
 			// 通道满了，等待一下
-			time.Sleep(time.Millisecond)
+			time.Sleep(time.Microsecond) // 减少等待时间到微秒级别
 			workChan <- struct {
 				seq1  fastq.Sequence
 				seq2  fastq.Sequence
@@ -448,8 +448,8 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 			fmt.Printf("Processed %d reads, Queue: %d, Next: %d, Max: %d, Memory: %.2f GB\n",
 				totalReads, queueLen, nextIdx, maxIdx, float64(m.Alloc)/1024/1024/1024)
 
-			// 如果内存使用过高，强制垃圾回收（调整到45GB）
-			if m.Alloc > 45*1024*1024*1024 { // 超过45GB
+			// 如果内存使用过高，强制垃圾回收（调整到48GB）
+			if m.Alloc > 48*1024*1024*1024 { // 超过48GB
 				fmt.Printf("High memory usage detected (%.2f GB), forcing garbage collection...\n",
 					float64(m.Alloc)/1024/1024/1024)
 				runtime.GC()
