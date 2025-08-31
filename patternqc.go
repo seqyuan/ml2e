@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	Version   = "3.0.6"
+	Version   = "3.0.7"
 	BuildTime = "2024-12-19"
 )
 
@@ -133,8 +133,6 @@ func getBasename(filePath string) string {
 
 	return filename
 }
-
-
 
 // 创建reader，支持普通文件和gz文件
 func createReader(filePath string) (io.Reader, *os.File, error) {
@@ -1445,8 +1443,6 @@ func main() {
 		fmt.Println("Error: workers must be at least 1")
 		usage()
 	}
-
-
 
 	// 执行优化流水线模式
 	err := optimizedPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
