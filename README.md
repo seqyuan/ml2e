@@ -19,10 +19,10 @@
 
 ```bash
 # 安装最新版本
-go install github.com/seqyuan/patternqc/v3@latest
+go install github.com/seqyuan/patternqc/v4@latest
 
 # 安装特定版本
-go install github.com/seqyuan/patternqc/v3@v3.0.3
+go install github.com/seqyuan/patternqc/v4@v4.0.0
 ```
 
 安装后，`patternqc` 命令会被安装到 `$GOPATH/bin` 目录中，确保该目录在你的 `PATH` 环境变量中。
@@ -135,7 +135,7 @@ patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pigz /usr/
 ## 安装
 
    ```bash
-   go install github.com/seqyuan/patternqc@latest
+   go install github.com/seqyuan/patternqc/v4@latest
    ```
 
 ### 自动发布流程
