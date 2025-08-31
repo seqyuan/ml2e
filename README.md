@@ -18,10 +18,10 @@
 
 ```bash
 # 安装最新版本
-go install github.com/seqyuan/patternqc@latest
+go install github.com/seqyuan/patternqc/v3@latest
 
 # 安装特定版本
-go install github.com/seqyuan/patternqc@v1.0.0
+go install github.com/seqyuan/patternqc/v3@v3.0.1
 ```
 
 安装后，`patternqc` 命令会被安装到 `$GOPATH/bin` 目录中，确保该目录在你的 `PATH` 环境变量中。
@@ -30,7 +30,7 @@ go install github.com/seqyuan/patternqc@v1.0.0
 
 #### 依赖要求
 
-- Go 1.22.2 或更高版本
+- Go 1.19 或更高版本
 - `github.com/seqyuan/annogene` 包
 
 #### 编译步骤
