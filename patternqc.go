@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	Version   = "3.0.8"
+	Version   = "3.0.9"
 	BuildTime = "2024-12-19"
 )
 
@@ -1012,7 +1012,7 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 
 		for scanner1.Next() {
 			seq1 := scanner1.Seq()
-			
+
 			// 等待R2线程提供对应的seq2
 			select {
 			case r2Data := <-r2Queue:
@@ -1038,7 +1038,7 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 
 		for scanner2.Next() {
 			seq2 := scanner2.Seq()
-			
+
 			// 将R2数据发送到R1线程
 			select {
 			case r2Queue <- seq2:
@@ -1060,7 +1060,7 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 
 			for readPair := range readQueue {
 				result := processReadPair(readPair.Seq1, readPair.Seq2, pattern, keepEveryN, &patternReadsInt, &mu)
-				
+
 				// 只有需要保留的reads才放入写入缓存池
 				if result.Keep {
 					select {
@@ -1081,7 +1081,7 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 		}()
 
 		batch := make([]fastq.Sequence, 0, 1000)
-		
+
 		for {
 			select {
 			case result := <-writeCache:
@@ -1092,9 +1092,9 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 					}
 					return
 				}
-				
+
 				batch = append(batch, result.Seq1)
-				
+
 				// 当达到1000条时，等待R2线程同步
 				if len(batch) >= 1000 {
 					select {
@@ -1118,7 +1118,7 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 		}()
 
 		batch := make([]fastq.Sequence, 0, 1000)
-		
+
 		for {
 			select {
 			case result := <-writeCache:
@@ -1129,9 +1129,9 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 					}
 					return
 				}
-				
+
 				batch = append(batch, result.Seq2)
-				
+
 				// 当达到1000条时，等待R1线程同步
 				if len(batch) >= 1000 {
 					// 等待R1批次就绪
@@ -1140,7 +1140,7 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 						// 同步写入R1和R2
 						writeR1Batch(r1Batch, bufferedW1)
 						writeR2Batch(batch, bufferedW2)
-						
+
 						// 更新统计
 						mu.Lock()
 						totalOutputReads += len(batch)
@@ -1150,7 +1150,7 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 							}
 						}
 						mu.Unlock()
-						
+
 						batch = make([]fastq.Sequence, 0, 1000)
 					case <-stopWriting:
 						return
@@ -1168,11 +1168,11 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 	close(stopReading)
 	close(stopProcessing)
 	close(readQueue)
-	
+
 	// 发送结束信号给输出线程
 	writeCache <- nil
 	writeCache <- nil
-	
+
 	<-r1WriteDone
 	<-r2WriteDone
 	close(stopWriting)
