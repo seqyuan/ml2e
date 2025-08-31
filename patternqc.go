@@ -46,7 +46,7 @@ func NewOrderedQueue() *OrderedQueue {
 		results:      make(map[int]*ProcessResult),
 		nextIndex:    0,
 		closed:       false,
-		maxQueueSize: 100000, // 增加到10万个结果，提高并发性能
+		maxQueueSize: 500000, // 增加到50万个结果，充分利用多线程
 	}
 	q.cond = sync.NewCond(&q.mu)
 	return q
@@ -171,11 +171,11 @@ func (q *OrderedQueue) Cleanup() {
 	defer q.mu.Unlock()
 
 	// 只在队列过大时才清理
-	if len(q.results) > q.maxQueueSize*3/4 { // 超过75%时才清理
+	if len(q.results) > q.maxQueueSize*4/5 { // 超过80%时才清理
 		// 找到需要清理的索引范围
 		toDelete := make([]int, 0)
 		for idx := range q.results {
-			if idx < q.nextIndex-q.maxQueueSize/4 { // 只清理最旧的25%
+			if idx < q.nextIndex-q.maxQueueSize/5 { // 只清理最旧的20%
 				toDelete = append(toDelete, idx)
 			}
 		}
@@ -354,12 +354,12 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 	// 计算保留的pattern reads数量
 	keepEveryN := 100 / percent
 
-	// 创建worker池 - 增加缓冲区大小
+	// 创建worker池 - 大幅增加缓冲区大小
 	workChan := make(chan struct {
 		seq1  fastq.Sequence
 		seq2  fastq.Sequence
 		index int
-	}, numWorkers*4) // 更大的缓冲区
+	}, numWorkers*20) // 大幅增加缓冲区，确保worker不被阻塞
 
 	// 启动worker goroutines
 	for i := 0; i < numWorkers; i++ {
@@ -402,7 +402,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 
 				// 定期清理队列内存
 				cleanupCounter++
-				if cleanupCounter >= 50 { // 减少清理频率，从10增加到50
+				if cleanupCounter >= 100 { // 进一步减少清理频率，让worker充分工作
 					queue.Cleanup()
 					cleanupCounter = 0
 				}
@@ -448,8 +448,8 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 			fmt.Printf("Processed %d reads, Queue: %d, Next: %d, Max: %d, Memory: %.2f GB\n",
 				totalReads, queueLen, nextIdx, maxIdx, float64(m.Alloc)/1024/1024/1024)
 
-			// 如果内存使用过高，强制垃圾回收（调整到25GB）
-			if m.Alloc > 25*1024*1024*1024 { // 超过25GB
+			// 如果内存使用过高，强制垃圾回收（调整到45GB）
+			if m.Alloc > 45*1024*1024*1024 { // 超过45GB
 				fmt.Printf("High memory usage detected (%.2f GB), forcing garbage collection...\n",
 					float64(m.Alloc)/1024/1024/1024)
 				runtime.GC()
