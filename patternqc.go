@@ -862,12 +862,14 @@ func usage() {
 	fmt.Printf("  -outdir     Output directory (required)\n")
 	fmt.Printf("  -percent    Percentage of pattern reads to keep (0-100, default: 5)\n")
 	fmt.Printf("  -workers    Number of worker threads (default: 4)\n")
+	fmt.Printf("  -mmap       Use memory-mapped file reading for better performance\n")
 	fmt.Printf("  -pigz       Path to pigz executable for compression\n")
 	fmt.Printf("  -version    Show version information\n\n")
 	fmt.Printf("Examples:\n")
 	fmt.Printf("  patternqc -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output\n")
 	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -percent 10 -workers 8\n")
 	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz\n")
+	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -mmap\n")
 	os.Exit(1)
 }
 
