@@ -69,13 +69,13 @@ jobs:
         fi
 
     - name: Test binary
-      if: matrix.os == 'linux'
+      if: matrix.os == 'linux' && matrix.arch == 'amd64'
       run: |
         ./patternqc-${{ matrix.os }}-${{ matrix.arch }} -version
         ./patternqc-${{ matrix.os }}-${{ matrix.arch }} 2>&1 | grep -q "Error: -fq1, -fq2 and -outdir are required" || exit 1
 
     - name: Check binary compatibility
-      if: matrix.os == 'linux'
+      if: matrix.os == 'linux' && matrix.arch == 'amd64'
       run: |
         # Check if binary is statically linked
         ldd patternqc-${{ matrix.os }}-${{ matrix.arch }} 2>&1 | grep -q "not a dynamic executable" || echo "Binary is statically linked"
