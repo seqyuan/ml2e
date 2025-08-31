@@ -1,15 +1,15 @@
-module github.com/seqyuan/patternqc/v4
+module github.com/seqyuan/patternqc/v5
 
 go 1.21
 
 toolchain go1.22.2
 
-require github.com/seqyuan/annogene v0.0.0-20250828102446-f948491e56f2
-
 require (
-	github.com/edsrzf/mmap-go v1.2.0 // indirect
-	golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e // indirect
+	github.com/edsrzf/mmap-go v1.2.0
+	github.com/seqyuan/annogene v0.0.0-20250828102446-f948491e56f2
 )
 
+require golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e // indirect
+
 // 添加可执行文件名称
-// go install github.com/seqyuan/patternqc/v4@latest
+// go install github.com/seqyuan/patternqc/v5@latest
