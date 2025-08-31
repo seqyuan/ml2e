@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	Version   = "5.2.0"
+	Version   = "5.3.0"
 	BuildTime = "2024-12-19"
 )
 
@@ -862,14 +862,14 @@ func usage() {
 	fmt.Printf("  -outdir     Output directory (required)\n")
 	fmt.Printf("  -percent    Percentage of pattern reads to keep (0-100, default: 5)\n")
 	fmt.Printf("  -workers    Number of worker threads (default: 4)\n")
-	fmt.Printf("  -mmap       Use memory-mapped file reading for better performance\n")
+	fmt.Printf("  -mmap       Use legacy pipeline mode (batch reading is now default)\n")
 	fmt.Printf("  -pigz       Path to pigz executable for compression\n")
 	fmt.Printf("  -version    Show version information\n\n")
 	fmt.Printf("Examples:\n")
 	fmt.Printf("  patternqc -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output\n")
 	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -percent 10 -workers 8\n")
 	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz\n")
-	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -mmap\n")
+	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output\n")
 	os.Exit(1)
 }
 
@@ -1748,7 +1748,7 @@ func main() {
 	flag.IntVar(&numWorkers, "workers", 4, "Number of worker threads")
 	flag.StringVar(&pigzPath, "pigz", "", "Path to pigz executable for compression")
 	flag.BoolVar(&showVersion, "version", false, "Show version information")
-	flag.BoolVar(&useMmap, "mmap", false, "Use memory-mapped file reading for better performance")
+	flag.BoolVar(&useMmap, "mmap", false, "Use legacy pipeline mode (batch reading is now default)")
 
 	// 解析命令行参数
 	flag.Parse()
@@ -1778,11 +1778,11 @@ func main() {
 	// 根据参数选择执行模式
 	var err error
 	if useMmap {
-		fmt.Println("Using dual thread pipeline mode...")
-		err = dualThreadPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
-	} else {
-		fmt.Println("Using optimized pipeline mode...")
+		fmt.Println("Using legacy pipeline mode...")
 		err = optimizedPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
+	} else {
+		fmt.Println("Using batch reading pipeline mode...")
+		err = dualThreadPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
 	}
 	if err != nil {
 		log.Fatalf("Error: %v", err)
