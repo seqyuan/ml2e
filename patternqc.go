@@ -852,7 +852,7 @@ func (sfw *SmartFastqWriter) serializeSequence(seq fastq.Sequence) []byte {
 }
 
 func usage() {
-	fmt.Printf("\nProgram: patternqc - FastQ filtering based on TSO pattern (Multi-threaded, Optimized)\n")
+	fmt.Printf("\nProgram: patternqc - FastQ filtering based on sequence pattern (Multi-threaded, Optimized)\n")
 	fmt.Printf("Usage: patternqc [options]\n\n")
 	fmt.Printf("Options:\n")
 	fmt.Printf("  -fq1        Input fastq file 1 (supports .gz format)\n")
@@ -1019,7 +1019,12 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 				// 将read pair发送到处理队列
 				select {
 				case readQueue <- ReadPair{Seq1: seq1, Seq2: r2Data}:
-					atomic.AddInt64(&totalReads, 1)
+					currentReads := atomic.AddInt64(&totalReads, 1)
+					
+					// 每读取2M reads输出进度
+					if currentReads%2000000 == 0 {
+						fmt.Printf("Read %d reads\n", currentReads)
+					}
 				case <-stopReading:
 					return
 				}
@@ -1263,8 +1268,7 @@ func main() {
 
 	// 显示版本信息
 	if showVersion {
-		fmt.Printf("PatternQC v%s (Build: %s)\n", Version, BuildTime)
-		fmt.Printf("GitHub: https://github.com/seqyuan/patternqc\n")
+		fmt.Printf("patternqc v%s (Build: %s)\n", Version, BuildTime)
 		os.Exit(0)
 	}
 
