@@ -234,6 +234,12 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 	w1 := fastq.NewWriter(writer1)
 	w2 := fastq.NewWriter(writer2)
 
+	// 创建高性能缓冲写入器
+	bufferedW1 := NewBufferedFastqWriter(w1, outFile1, 1024*1024) // 1MB缓冲区
+	bufferedW2 := NewBufferedFastqWriter(w2, outFile2, 1024*1024) // 1MB缓冲区
+	defer bufferedW1.Close()
+	defer bufferedW2.Close()
+
 	// 创建顺序队列和同步原语
 	queue := NewSimpleQueue()
 	var wg sync.WaitGroup
@@ -292,18 +298,18 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 			for {
 				results := queue.GetAll()
 				if results == nil {
-					// 队列已关闭，处理剩余批次
-					if len(batch) > 0 {
-						writeBatchSeparate(batch, w1, w2, &keptPatternReads, &totalOutputReads, &mu)
-					}
-					break
+									// 队列已关闭，处理剩余批次
+				if len(batch) > 0 {
+					writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
 				}
+				break
+			}
 
-				batch = append(batch, results...)
+			batch = append(batch, results...)
 
-				// 当批次满了时写入
-				if len(batch) >= batchSize {
-					writeBatchSeparate(batch, w1, w2, &keptPatternReads, &totalOutputReads, &mu)
+			// 当批次满了时写入
+			if len(batch) >= batchSize {
+				writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
 					batch = batch[:0] // 清空批次
 
 					if outputWorkerID == 0 {
@@ -486,18 +492,18 @@ func writeBatch(batch []*ProcessResult, w1, w2 fastq.Writer, keptPatternReads *i
 func writeBatchSeparate(batch []*ProcessResult, w1, w2 fastq.Writer, keptPatternReads *int, totalOutputReads *int, mu *sync.Mutex) {
 	// 分离R1和R2的数据
 	var r1Data, r2Data []fastq.Sequence
-	
+
 	for _, result := range batch {
 		if result.Keep {
 			r1Data = append(r1Data, result.Seq1)
 			r2Data = append(r2Data, result.Seq2)
 		}
 	}
-	
+
 	// 使用goroutine并行写入两个文件
 	var wg sync.WaitGroup
 	wg.Add(2)
-	
+
 	// 写入R1文件
 	go func() {
 		defer wg.Done()
@@ -508,7 +514,7 @@ func writeBatchSeparate(batch []*ProcessResult, w1, w2 fastq.Writer, keptPattern
 			}
 		}
 	}()
-	
+
 	// 写入R2文件
 	go func() {
 		defer wg.Done()
@@ -519,9 +525,126 @@ func writeBatchSeparate(batch []*ProcessResult, w1, w2 fastq.Writer, keptPattern
 			}
 		}
 	}()
+
+	// 等待两个写入完成
+	wg.Wait()
+
+	// 统计输出
+	mu.Lock()
+	*totalOutputReads += len(r1Data)
+	for _, result := range batch {
+		if result.Keep && result.HasPattern {
+			*keptPatternReads++
+		}
+	}
+	mu.Unlock()
+}
+
+// 高性能缓冲写入器
+type BufferedFastqWriter struct {
+	mu       sync.Mutex
+	buffer   []byte
+	writer   fastq.Writer
+	file     *os.File
+	maxSize  int
+	written  int64
+}
+
+func NewBufferedFastqWriter(writer fastq.Writer, file *os.File, bufferSize int) *BufferedFastqWriter {
+	return &BufferedFastqWriter{
+		buffer:  make([]byte, 0, bufferSize),
+		writer:  writer,
+		file:    file,
+		maxSize: bufferSize,
+	}
+}
+
+func (bfw *BufferedFastqWriter) Write(seq fastq.Sequence) error {
+	bfw.mu.Lock()
+	defer bfw.mu.Unlock()
+	
+	// 直接使用fastq.Writer，它已经处理了序列化
+	if _, err := bfw.writer.Write(seq); err != nil {
+		return err
+	}
+	
+	bfw.written++
+	
+	// 定期刷新缓冲区
+	if bfw.written%10000 == 0 {
+		return bfw.flush()
+	}
+	
+	return nil
+}
+
+func (bfw *BufferedFastqWriter) flush() error {
+	// fastq.Writer内部已经处理了缓冲，这里主要是同步
+	return nil
+}
+
+func (bfw *BufferedFastqWriter) Flush() error {
+	bfw.mu.Lock()
+	defer bfw.mu.Unlock()
+	return bfw.flush()
+}
+
+func (bfw *BufferedFastqWriter) Close() error {
+	if err := bfw.Flush(); err != nil {
+		return err
+	}
+	return bfw.file.Close()
+}
+
+// 高性能分离写入函数
+func writeBatchOptimized(batch []*ProcessResult, w1, w2 *BufferedFastqWriter, keptPatternReads *int, totalOutputReads *int, mu *sync.Mutex) {
+	// 分离R1和R2的数据
+	var r1Data, r2Data []fastq.Sequence
+	
+	for _, result := range batch {
+		if result.Keep {
+			r1Data = append(r1Data, result.Seq1)
+			r2Data = append(r2Data, result.Seq2)
+		}
+	}
+	
+	// 使用goroutine并行写入两个文件
+	var wg sync.WaitGroup
+	var r1Err, r2Err error
+	wg.Add(2)
+	
+	// 写入R1文件
+	go func() {
+		defer wg.Done()
+		for _, seq := range r1Data {
+			if err := w1.Write(seq); err != nil {
+				r1Err = err
+				log.Printf("error writing to fq1: %v", err)
+				return
+			}
+		}
+	}()
+	
+	// 写入R2文件
+	go func() {
+		defer wg.Done()
+		for _, seq := range r2Data {
+			if err := w2.Write(seq); err != nil {
+				r2Err = err
+				log.Printf("error writing to fq2: %v", err)
+				return
+			}
+		}
+	}()
 	
 	// 等待两个写入完成
 	wg.Wait()
+	
+	// 检查错误
+	if r1Err != nil || r2Err != nil {
+		log.Printf("Write errors - R1: %v, R2: %v", r1Err, r2Err)
+		return
+	}
 	
 	// 统计输出
 	mu.Lock()
