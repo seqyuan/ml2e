@@ -927,7 +927,7 @@ type ReadPair struct {
 	Seq2 fastq.Sequence
 }
 
-// 高性能流水线模式 - 使用内存映射读取、1M批次处理、缓存池队列输出
+// 高性能流水线模式 - 双读取线程、实时处理、双输出线程
 func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, pigzPath string) error {
 	// 创建输出目录
 	if err := os.MkdirAll(outdir, 0755); err != nil {
@@ -979,150 +979,203 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 	scanner1 := fastq.NewScanner(fastq.NewReader(reader1))
 	scanner2 := fastq.NewScanner(fastq.NewReader(reader2))
 
-	// 配置参数 - 减少批次大小到1M
-	batchSize := 1000000 // 1M reads per batch
-
 	// 统计变量
 	var totalReads, patternReads int64
-	var keptPatternReads, totalOutputReads int // 用于writeBatchOptimized函数
-	var patternReadsInt int                    // 用于processReadPair函数
+	var keptPatternReads, totalOutputReads int
+	var patternReadsInt int
 	var mu sync.Mutex
 
 	// 计算保留的pattern reads数量
 	keepEveryN := 100 / percent
 
-	// 创建缓存池队列 - 用于存储处理完成的reads
-	resultQueue := make(chan *ProcessResult, 100000) // 10万容量的缓存池
-	defer close(resultQueue)
+	// 创建写入缓存池 - 10M reads容量
+	writeCache := make(chan *ProcessResult, 10000000) // 10M容量
+	defer close(writeCache)
 
-	// 启动输出线程 - 专门处理缓存池中的结果
-	outputDone := make(chan bool)
+	// 创建读取队列 - 用于worker处理
+	readQueue := make(chan ReadPair, 100000) // 10万容量
+	defer close(readQueue)
+
+	// 创建控制通道
+	r2Queue := make(chan fastq.Sequence, 100000) // R2数据队列
+	stopReading := make(chan bool)
+	stopProcessing := make(chan bool)
+	stopWriting := make(chan bool)
+	r1BatchReady := make(chan []fastq.Sequence, 10) // R1批次就绪信号
+
+	// 启动R1读取线程
+	r1Done := make(chan bool)
 	go func() {
 		defer func() {
-			outputDone <- true
+			r1Done <- true
 		}()
 
-		// 批量收集结果进行写入
-		batch := make([]*ProcessResult, 0, 100000) // 10万容量的写入批次
-
-		for result := range resultQueue {
-			if result == nil {
-				// 结束信号，处理剩余批次
-				if len(batch) > 0 {
-					writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
-					fmt.Printf("Output thread wrote final batch of %d results\n", len(batch))
+		for scanner1.Next() {
+			seq1 := scanner1.Seq()
+			
+			// 等待R2线程提供对应的seq2
+			select {
+			case r2Data := <-r2Queue:
+				// 将read pair发送到处理队列
+				select {
+				case readQueue <- ReadPair{Seq1: seq1, Seq2: r2Data}:
+					atomic.AddInt64(&totalReads, 1)
+				case <-stopReading:
+					return
 				}
-				break
-			}
-
-			batch = append(batch, result)
-
-			// 当批次满了时写入
-			if len(batch) >= 100000 {
-				writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
-				fmt.Printf("Output thread wrote batch of %d results\n", len(batch))
-				batch = batch[:0] // 清空批次
+			case <-stopReading:
+				return
 			}
 		}
 	}()
 
-	// 启动多个读取线程 - 使用内存映射方式读取大块数据
-	readDone := make(chan bool)
-	numReadWorkers := 2 // 使用2个读取线程
+	// 启动R2读取线程
+	r2Done := make(chan bool)
+	go func() {
+		defer func() {
+			r2Done <- true
+		}()
 
-	for i := 0; i < numReadWorkers; i++ {
-		go func(readWorkerID int) {
+		for scanner2.Next() {
+			seq2 := scanner2.Seq()
+			
+			// 将R2数据发送到R1线程
+			select {
+			case r2Queue <- seq2:
+			case <-stopReading:
+				return
+			}
+		}
+	}()
+
+	// 启动worker线程池
+	workerDone := make(chan bool)
+	for i := 0; i < numWorkers; i++ {
+		go func(workerID int) {
 			defer func() {
-				if readWorkerID == 0 {
-					readDone <- true
+				if workerID == 0 {
+					workerDone <- true
 				}
 			}()
 
-			// 每个读取线程处理自己的批次
-			readBatch := make([]ReadPair, 0, batchSize)
-
-			for {
-				// 读取1M reads或直到文件结束
-				for j := 0; j < batchSize; j++ {
-					if !scanner1.Next() || !scanner2.Next() {
-						break
+			for readPair := range readQueue {
+				result := processReadPair(readPair.Seq1, readPair.Seq2, pattern, keepEveryN, &patternReadsInt, &mu)
+				
+				// 只有需要保留的reads才放入写入缓存池
+				if result.Keep {
+					select {
+					case writeCache <- result:
+					case <-stopProcessing:
+						return
 					}
-
-					seq1 := scanner1.Seq()
-					seq2 := scanner2.Seq()
-
-					readBatch = append(readBatch, ReadPair{
-						Seq1: seq1,
-						Seq2: seq2,
-					})
-
-					atomic.AddInt64(&totalReads, 1)
-				}
-
-				// 如果没有读取到数据，退出
-				if len(readBatch) == 0 {
-					break
-				}
-
-				fmt.Printf("Read worker %d: read %d reads, Total: %d\n", readWorkerID, len(readBatch), totalReads)
-
-				// 处理读取的批次 - 使用多个worker并行处理
-				results := make([]*ProcessResult, len(readBatch))
-				var wg sync.WaitGroup
-
-				// 将批次分成多个子批次给worker处理
-				subBatchSize := len(readBatch) / numWorkers
-				if subBatchSize == 0 {
-					subBatchSize = 1
-				}
-
-				for j := 0; j < numWorkers; j++ {
-					wg.Add(1)
-					go func(workerID int) {
-						defer wg.Done()
-
-						start := workerID * subBatchSize
-						end := start + subBatchSize
-						if workerID == numWorkers-1 {
-							end = len(readBatch) // 最后一个worker处理剩余的所有
-						}
-
-						for k := start; k < end; k++ {
-							result := processReadPair(readBatch[k].Seq1, readBatch[k].Seq2, pattern, keepEveryN, &patternReadsInt, &mu)
-							results[k] = result
-						}
-					}(j)
-				}
-
-				// 等待所有worker完成
-				wg.Wait()
-
-				// 将处理结果放入缓存池队列
-				for _, result := range results {
-					resultQueue <- result
-				}
-
-				fmt.Printf("Read worker %d: processed and queued %d results\n", readWorkerID, len(results))
-
-				// 清空读取批次
-				readBatch = readBatch[:0]
-
-				// 如果读取的数据少于批次大小，说明文件结束了
-				if len(readBatch) < batchSize {
-					break
 				}
 			}
 		}(i)
 	}
 
-	// 等待所有读取线程完成
-	<-readDone
+	// 启动R1输出线程
+	r1WriteDone := make(chan bool)
+	go func() {
+		defer func() {
+			r1WriteDone <- true
+		}()
 
+		batch := make([]fastq.Sequence, 0, 1000)
+		
+		for {
+			select {
+			case result := <-writeCache:
+				if result == nil {
+					// 结束信号
+					if len(batch) > 0 {
+						writeR1Batch(batch, bufferedW1)
+					}
+					return
+				}
+				
+				batch = append(batch, result.Seq1)
+				
+				// 当达到1000条时，等待R2线程同步
+				if len(batch) >= 1000 {
+					select {
+					case r1BatchReady <- batch:
+						batch = make([]fastq.Sequence, 0, 1000)
+					case <-stopWriting:
+						return
+					}
+				}
+			case <-stopWriting:
+				return
+			}
+		}
+	}()
+
+	// 启动R2输出线程
+	r2WriteDone := make(chan bool)
+	go func() {
+		defer func() {
+			r2WriteDone <- true
+		}()
+
+		batch := make([]fastq.Sequence, 0, 1000)
+		
+		for {
+			select {
+			case result := <-writeCache:
+				if result == nil {
+					// 结束信号
+					if len(batch) > 0 {
+						writeR2Batch(batch, bufferedW2)
+					}
+					return
+				}
+				
+				batch = append(batch, result.Seq2)
+				
+				// 当达到1000条时，等待R1线程同步
+				if len(batch) >= 1000 {
+					// 等待R1批次就绪
+					select {
+					case r1Batch := <-r1BatchReady:
+						// 同步写入R1和R2
+						writeR1Batch(r1Batch, bufferedW1)
+						writeR2Batch(batch, bufferedW2)
+						
+						// 更新统计
+						mu.Lock()
+						totalOutputReads += len(batch)
+						for _, r := range r1Batch {
+							if containsPattern(string(r.Letters), pattern) {
+								keptPatternReads++
+							}
+						}
+						mu.Unlock()
+						
+						batch = make([]fastq.Sequence, 0, 1000)
+					case <-stopWriting:
+						return
+					}
+				}
+			case <-stopWriting:
+				return
+			}
+		}
+	}()
+
+	// 等待所有线程完成
+	<-r1Done
+	<-r2Done
+	close(stopReading)
+	close(stopProcessing)
+	close(readQueue)
+	
 	// 发送结束信号给输出线程
-	resultQueue <- nil
-
-	// 等待输出完成
-	<-outputDone
+	writeCache <- nil
+	writeCache <- nil
+	
+	<-r1WriteDone
+	<-r2WriteDone
+	close(stopWriting)
 
 	// 强制刷新缓冲区
 	fmt.Println("Flushing all buffers...")
@@ -1135,10 +1188,10 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 
 	// 检查错误
 	if err := scanner1.Error(); err != nil {
-		return fmt.Errorf("error reading fq1: %v", err)
+		return fmt.Errorf("error reading fq1 (%s): %v", fq1, err)
 	}
 	if err := scanner2.Error(); err != nil {
-		return fmt.Errorf("error reading fq2: %v", err)
+		return fmt.Errorf("error reading fq2 (%s): %v", fq2, err)
 	}
 
 	// 计算最终比例
@@ -1170,6 +1223,24 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 	}
 
 	return nil
+}
+
+// 写入R1批次
+func writeR1Batch(batch []fastq.Sequence, writer *BufferedFastqWriter) {
+	for _, seq := range batch {
+		if err := writer.Write(seq); err != nil {
+			log.Printf("Error writing R1: %v", err)
+		}
+	}
+}
+
+// 写入R2批次
+func writeR2Batch(batch []fastq.Sequence, writer *BufferedFastqWriter) {
+	for _, seq := range batch {
+		if err := writer.Write(seq); err != nil {
+			log.Printf("Error writing R2: %v", err)
+		}
+	}
 }
 
 func main() {
