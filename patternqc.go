@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	Version   = "3.0.4"
+	Version   = "3.0.5"
 	BuildTime = "2024-12-19"
 )
 
@@ -985,7 +985,7 @@ func simplePipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorker
 	// 统计变量
 	var totalReads, patternReads int64
 	var keptPatternReads, totalOutputReads int // 用于writeBatchOptimized函数
-	var patternReadsInt int // 用于processReadPair函数
+	var patternReadsInt int                    // 用于processReadPair函数
 	var mu sync.Mutex
 
 	// 计算保留的pattern reads数量
@@ -1216,7 +1216,7 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 	// 统计变量
 	var totalReads, patternReads int64
 	var keptPatternReads, totalOutputReads int // 用于writeBatchOptimized函数
-	var patternReadsInt int // 用于processReadPair函数
+	var patternReadsInt int                    // 用于processReadPair函数
 	var mu sync.Mutex
 
 	// 计算保留的pattern reads数量
