@@ -361,7 +361,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 				result := processReadPair(work.seq1, work.seq2, work.index, pattern, keepEveryN, &patternReads, &mu)
 				queue.Add(result)
 				processedCount++
-				
+
 				// 每处理10000个reads输出一次worker状态
 				if processedCount%10000 == 0 {
 					fmt.Printf("Worker %d processed %d reads\n", workerID, processedCount)
@@ -377,7 +377,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 		defer func() { outputDone <- true }()
 
 		// 增加批量写入大小，提高I/O效率
-		batchSize := 50000 // 从5000大幅增加到50000
+		batchSize := 1000000 // 增加到100万个结果，大幅提高I/O效率
 		batch := make([]*ProcessResult, 0, batchSize)
 		cleanupCounter := 0
 
@@ -410,7 +410,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 
 	// 读取并分发工作 - 高性能版本
 	index := 0
-	
+
 	for scanner1.Next() && scanner2.Next() {
 		seq1 := scanner1.Seq()
 		seq2 := scanner2.Seq()
