@@ -948,9 +948,10 @@ func simplePipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorker
 	defer file2.Close()
 
 	// 创建输出文件
-	basename := getBasename(fq2)
-	outFile1Path := filepath.Join(outdir, basename)
-	outFile2Path := filepath.Join(outdir, basename)
+	basename1 := getBasename(fq1)
+	basename2 := getBasename(fq2)
+	outFile1Path := filepath.Join(outdir, basename1)
+	outFile2Path := filepath.Join(outdir, basename2)
 
 	writer1, outFile1, err := createWriter(outFile1Path)
 	if err != nil {
@@ -1132,7 +1133,7 @@ func simplePipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorker
 	}
 
 	// 输出统计信息
-	statsFile := filepath.Join(outdir, basename+".stats.txt")
+	statsFile := filepath.Join(outdir, basename2+".stats.txt")
 	statsContent := fmt.Sprintf("Total reads: %d\nOriginal pattern reads: %d\nKept pattern reads: %d\nTotal output reads: %d\nFinal ratio: %.2f%%\n",
 		totalReads, patternReads, keptPatternReads, totalOutputReads, finalRatio)
 
