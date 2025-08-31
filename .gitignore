@@ -1,6 +1,7 @@
 # 编译生成的文件
 patternqc
 patternqc.exe
+patternqc-*/
 
 # 测试输出目录
 test_output/
