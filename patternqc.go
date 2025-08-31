@@ -46,7 +46,7 @@ func NewOrderedQueue() *OrderedQueue {
 		results:      make(map[int]*ProcessResult),
 		nextIndex:    0,
 		closed:       false,
-		maxQueueSize: 10000, // 限制队列最大10000个结果
+		maxQueueSize: 100000, // 增加到10万个结果，提高并发性能
 	}
 	q.cond = sync.NewCond(&q.mu)
 	return q
@@ -170,12 +170,12 @@ func (q *OrderedQueue) Cleanup() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	// 清理超过最大大小的旧数据
-	if len(q.results) > q.maxQueueSize {
+	// 只在队列过大时才清理
+	if len(q.results) > q.maxQueueSize*3/4 { // 超过75%时才清理
 		// 找到需要清理的索引范围
 		toDelete := make([]int, 0)
 		for idx := range q.results {
-			if idx < q.nextIndex-q.maxQueueSize/2 {
+			if idx < q.nextIndex-q.maxQueueSize/4 { // 只清理最旧的25%
 				toDelete = append(toDelete, idx)
 			}
 		}
@@ -186,7 +186,7 @@ func (q *OrderedQueue) Cleanup() {
 		}
 
 		if len(toDelete) > 0 {
-			fmt.Printf("Cleaned up %d old results from queue\n", len(toDelete))
+			fmt.Printf("Cleaned up %d old results from queue (queue size: %d)\n", len(toDelete), len(q.results))
 		}
 	}
 }
@@ -402,7 +402,7 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 
 				// 定期清理队列内存
 				cleanupCounter++
-				if cleanupCounter >= 10 { // 每10个批次清理一次
+				if cleanupCounter >= 50 { // 减少清理频率，从10增加到50
 					queue.Cleanup()
 					cleanupCounter = 0
 				}
@@ -448,8 +448,8 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 			fmt.Printf("Processed %d reads, Queue: %d, Next: %d, Max: %d, Memory: %.2f GB\n",
 				totalReads, queueLen, nextIdx, maxIdx, float64(m.Alloc)/1024/1024/1024)
 
-			// 如果内存使用过高，强制垃圾回收
-			if m.Alloc > 8*1024*1024*1024 { // 超过8GB
+			// 如果内存使用过高，强制垃圾回收（调整到25GB）
+			if m.Alloc > 25*1024*1024*1024 { // 超过25GB
 				fmt.Printf("High memory usage detected (%.2f GB), forcing garbage collection...\n",
 					float64(m.Alloc)/1024/1024/1024)
 				runtime.GC()
