@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	Version   = "4.0.0"
+	Version   = "4.0.1"
 	BuildTime = "2024-12-19"
 )
 
@@ -1020,7 +1020,7 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 				select {
 				case readQueue <- ReadPair{Seq1: seq1, Seq2: r2Data}:
 					currentReads := atomic.AddInt64(&totalReads, 1)
-					
+
 					// 每读取2M reads输出进度
 					if currentReads%2000000 == 0 {
 						fmt.Printf("Read %d reads\n", currentReads)
