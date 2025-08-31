@@ -63,7 +63,10 @@ func (q *SimpleQueue) GetAll() []*ProcessResult {
 	defer q.mu.Unlock()
 
 	if len(q.results) == 0 {
-		return nil
+		if q.closed {
+			return nil // 队列已关闭且为空
+		}
+		return []*ProcessResult{} // 返回空切片，表示暂时没有数据
 	}
 
 	// 返回所有结果并清空队列
@@ -84,6 +87,13 @@ func (q *SimpleQueue) Len() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.results)
+}
+
+// 检查队列是否已关闭
+func (q *SimpleQueue) IsClosed() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.closed
 }
 
 // 反向互补序列
@@ -299,23 +309,31 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 			for {
 				results := queue.GetAll()
 				if results == nil {
-					// 队列已关闭，处理剩余批次
+					// 队列已关闭且为空，处理剩余批次
 					if len(batch) > 0 {
 						writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
+						fmt.Printf("Output worker %d wrote final batch of %d results\n", outputWorkerID, len(batch))
 					}
 					break
 				}
 
-				batch = append(batch, results...)
+				// 如果有数据，添加到批次
+				if len(results) > 0 {
+					batch = append(batch, results...)
+				}
 
 				// 当批次满了时写入
 				if len(batch) >= batchSize {
 					writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
+					fmt.Printf("Output worker %d wrote batch of %d results\n", outputWorkerID, len(batch))
 					batch = batch[:0] // 清空批次
+				}
 
-					if outputWorkerID == 0 {
-						fmt.Printf("Output worker %d wrote batch of %d results\n", outputWorkerID, batchSize)
-					}
+				// 如果队列已关闭且批次不为空，立即写入
+				if queue.IsClosed() && len(batch) > 0 {
+					writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
+					fmt.Printf("Output worker %d wrote remaining batch of %d results\n", outputWorkerID, len(batch))
+					batch = batch[:0]
 				}
 			}
 		}(i)
@@ -367,23 +385,34 @@ func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, p
 	// 关闭队列
 	queue.Close()
 
-	// 等待输出完成，根据数据量动态调整超时时间
-	timeout := time.Duration(totalReads/1000000+1) * 60 * time.Second // 每百万reads增加1分钟
-	if timeout < 30*time.Second {
-		timeout = 30 * time.Second
-	}
-	if timeout > 600*time.Second {
-		timeout = 600 * time.Second // 最大10分钟
-	}
+	// 等待输出完成，确保所有数据都写入
+	fmt.Printf("Waiting for output completion...\n")
 
-	fmt.Printf("Waiting for output completion (timeout: %v)...\n", timeout)
+	// 等待所有输出goroutine完成
 	select {
 	case <-outputDone:
 		fmt.Println("Output completed successfully")
-	case <-time.After(timeout):
-		fmt.Printf("Warning: Output timeout after %v, but processing completed\n", timeout)
+	case <-time.After(30 * time.Second):
+		fmt.Printf("Warning: Output timeout after 30s, checking final status...\n")
 		queueLen := queue.Len()
-		fmt.Printf("Final queue status - Length: %d\n", queueLen)
+		fmt.Printf("Final queue status - Length: %d, Closed: %v\n", queueLen, queue.IsClosed())
+
+		// 强制等待更长时间，确保数据写入
+		select {
+		case <-outputDone:
+			fmt.Println("Output completed after extended wait")
+		case <-time.After(60 * time.Second):
+			fmt.Printf("Error: Output timeout after 90s total, some data may be lost\n")
+		}
+	}
+
+	// 强制刷新所有缓冲区
+	fmt.Println("Flushing all buffers...")
+	if err := bufferedW1.Flush(); err != nil {
+		fmt.Printf("Error flushing bufferedW1: %v\n", err)
+	}
+	if err := bufferedW2.Flush(); err != nil {
+		fmt.Printf("Error flushing bufferedW2: %v\n", err)
 	}
 
 	if err := scanner1.Error(); err != nil {
@@ -580,8 +609,8 @@ func (bfw *BufferedFastqWriter) Write(seq fastq.Sequence) error {
 }
 
 func (bfw *BufferedFastqWriter) flush() error {
-	// fastq.Writer内部已经处理了缓冲，这里主要是同步
-	return nil
+	// 强制同步到磁盘
+	return bfw.file.Sync()
 }
 
 func (bfw *BufferedFastqWriter) Flush() error {
