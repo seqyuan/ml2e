@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	Version   = "0.6.3"
+	Version   = "0.7.0"
 	BuildTime = "2025-08-29"
 )
 
@@ -194,6 +194,18 @@ func processReadPair(seq1, seq2 fastq.Sequence, pattern string, keepEveryN int, 
 		HasPattern: hasPattern,
 		Keep:       keep,
 	}
+}
+
+// 批量处理reads的worker函数
+func processReadPairBatch(readPairs []ReadPair, pattern string, keepEveryN int, patternCount *int, mu *sync.Mutex) []*ProcessResult {
+	results := make([]*ProcessResult, 0, len(readPairs))
+
+	for _, readPair := range readPairs {
+		result := processReadPair(readPair.Seq1, readPair.Seq2, pattern, keepEveryN, patternCount, mu)
+		results = append(results, result)
+	}
+
+	return results
 }
 
 // 使用pigz压缩文件
@@ -708,8 +720,8 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 			writeDone <- true
 		}()
 
-		r1Batch := make([]fastq.Sequence, 0, 1000)
-		r2Batch := make([]fastq.Sequence, 0, 1000)
+		r1Batch := make([]fastq.Sequence, 0, 2000)
+		r2Batch := make([]fastq.Sequence, 0, 2000)
 
 		for {
 			select {
@@ -736,8 +748,8 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 				r1Batch = append(r1Batch, result.Seq1)
 				r2Batch = append(r2Batch, result.Seq2)
 
-				// 当达到1000条时，同步写入
-				if len(r1Batch) >= 1000 {
+				// 当达到2000条时，同步写入
+				if len(r1Batch) >= 2000 {
 					writeR1Batch(r1Batch, bufferedW1)
 					writeR2Batch(r2Batch, bufferedW2)
 
@@ -751,8 +763,8 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 					}
 					mu.Unlock()
 
-					r1Batch = make([]fastq.Sequence, 0, 1000)
-					r2Batch = make([]fastq.Sequence, 0, 1000)
+					r1Batch = make([]fastq.Sequence, 0, 2000)
+					r2Batch = make([]fastq.Sequence, 0, 2000)
 				}
 			case <-stopWriting:
 				return
@@ -826,7 +838,7 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 	return nil
 }
 
-// 双线程并行读取模式
+// 双线程并行读取模式 - 优化版本：worker批量处理
 func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, pigzPath string) error {
 	// 创建输出目录
 	if err := os.MkdirAll(outdir, 0755); err != nil {
@@ -887,21 +899,27 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 	// 计算保留的pattern reads数量
 	keepEveryN := 100 / percent
 
-	// 创建写入缓存池，增加容量
-	writeCache := make(chan *ProcessResult, 20000000) // 20M容量
+	// 优化配置：worker批量处理大小
+	const workerBatchSize = 500 // 每个worker一次处理500条reads
+	const readBatchSize = 10000 // 读取批次大小保持10万
 
-	// 创建读取队列，增加容量
-	readQueue := make(chan ReadPair, 500000) // 50万容量
+	// 根据worker批量处理大小调整缓存池容量
+	// 假设每个worker处理500条，6个worker，需要3倍缓冲
+	writeCacheCapacity := int64(numWorkers) * workerBatchSize * 3
+	readQueueCapacity := int64(numWorkers) * workerBatchSize * 2
+
+	// 创建写入缓存池，根据worker批量处理调整容量
+	writeCache := make(chan *ProcessResult, writeCacheCapacity)
+
+	// 创建读取队列，根据worker批量处理调整容量
+	readQueue := make(chan []ReadPair, readQueueCapacity)
 
 	// 创建控制通道
 	stopReading := make(chan bool)
 	stopProcessing := make(chan bool)
 	stopWriting := make(chan bool)
 
-	r1BatchReady := make(chan []fastq.Sequence, 20) // 增加缓冲区
-
 	// 批量读取配置
-	const batchSize = 10000 // 1万条reads一批
 	r1BatchQueue := make(chan []fastq.Sequence, 10)
 	r2BatchQueue := make(chan []fastq.Sequence, 10)
 
@@ -912,13 +930,13 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 			r1Done <- true
 		}()
 
-		batch := make([]fastq.Sequence, 0, batchSize)
+		batch := make([]fastq.Sequence, 0, readBatchSize)
 		for scanner1.Next() {
 			batch = append(batch, scanner1.Seq())
-			if len(batch) >= batchSize {
+			if len(batch) >= readBatchSize {
 				select {
 				case r1BatchQueue <- batch:
-					batch = make([]fastq.Sequence, 0, batchSize)
+					batch = make([]fastq.Sequence, 0, readBatchSize)
 				case <-stopReading:
 					return
 				}
@@ -942,13 +960,13 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 			r2Done <- true
 		}()
 
-		batch := make([]fastq.Sequence, 0, batchSize)
+		batch := make([]fastq.Sequence, 0, readBatchSize)
 		for scanner2.Next() {
 			batch = append(batch, scanner2.Seq())
-			if len(batch) >= batchSize {
+			if len(batch) >= readBatchSize {
 				select {
 				case r2BatchQueue <- batch:
-					batch = make([]fastq.Sequence, 0, batchSize)
+					batch = make([]fastq.Sequence, 0, readBatchSize)
 				case <-stopReading:
 					return
 				}
@@ -965,7 +983,7 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 		close(r2BatchQueue)
 	}()
 
-	// 启动批量配对线程
+	// 启动批量配对线程 - 现在发送ReadPair批次而不是单个
 	pairDone := make(chan bool)
 	go func() {
 		defer func() {
@@ -989,14 +1007,34 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 					minLen = len(r2Batch)
 				}
 
+				// 将配对的reads分批发送给worker
+				readPairBatch := make([]ReadPair, 0, workerBatchSize)
 				for i := 0; i < minLen; i++ {
-					select {
-					case readQueue <- ReadPair{Seq1: r1Batch[i], Seq2: r2Batch[i]}:
-						currentReads := atomic.AddInt64(&totalReads, 1)
+					readPairBatch = append(readPairBatch, ReadPair{Seq1: r1Batch[i], Seq2: r2Batch[i]})
 
-						// 每读取2M reads输出进度
+					// 当批次满时发送
+					if len(readPairBatch) >= workerBatchSize {
+						select {
+						case readQueue <- readPairBatch:
+							currentReads := atomic.AddInt64(&totalReads, int64(len(readPairBatch)))
+							// 每读取2M reads输出进度
+							if currentReads%2000000 == 0 {
+								fmt.Printf("Read %d reads (batch mode, worker batch size: %d)\n", currentReads, workerBatchSize)
+							}
+							readPairBatch = make([]ReadPair, 0, workerBatchSize)
+						case <-stopReading:
+							return
+						}
+					}
+				}
+
+				// 发送最后一批（可能不足workerBatchSize）
+				if len(readPairBatch) > 0 {
+					select {
+					case readQueue <- readPairBatch:
+						currentReads := atomic.AddInt64(&totalReads, int64(len(readPairBatch)))
 						if currentReads%2000000 == 0 {
-							fmt.Printf("Read %d reads (batch mode)\n", currentReads)
+							fmt.Printf("Read %d reads (batch mode, worker batch size: %d)\n", currentReads, workerBatchSize)
 						}
 					case <-stopReading:
 						return
@@ -1008,24 +1046,27 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 		}
 	}()
 
-	// 启动worker线程池
-	workerDone := make(chan bool)
+	// 启动worker线程池 - 现在批量处理
+	workerWg := sync.WaitGroup{}
 	for i := 0; i < numWorkers; i++ {
+		workerWg.Add(1)
 		go func(workerID int) {
 			defer func() {
-				if workerID == 0 {
-					workerDone <- true
-				}
+				workerWg.Done()
 			}()
 
-			for readPair := range readQueue {
-				result := processReadPair(readPair.Seq1, readPair.Seq2, pattern, keepEveryN, &patternReadsInt, &mu)
+			for readPairBatch := range readQueue {
+				// 批量处理reads
+				results := processReadPairBatch(readPairBatch, pattern, keepEveryN, &patternReadsInt, &mu)
 
-				if result.Keep {
-					select {
-					case writeCache <- result:
-					case <-stopProcessing:
-						return
+				// 批量发送结果
+				for _, result := range results {
+					if result.Keep {
+						select {
+						case writeCache <- result:
+						case <-stopProcessing:
+							return
+						}
 					}
 				}
 			}
@@ -1039,7 +1080,7 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 			r1WriteDone <- true
 		}()
 
-		batch := make([]fastq.Sequence, 0, 1000)
+		batch := make([]fastq.Sequence, 0, 2000)
 
 		for {
 			select {
@@ -1053,15 +1094,14 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 
 				batch = append(batch, result.Seq1)
 
-				if len(batch) >= 1000 {
-					select {
-					case r1BatchReady <- batch:
-						batch = make([]fastq.Sequence, 0, 1000)
-					case <-stopWriting:
-						return
-					}
+				if len(batch) >= 2000 {
+					writeR1Batch(batch, bufferedW1)
+					batch = make([]fastq.Sequence, 0, 2000)
 				}
 			case <-stopWriting:
+				if len(batch) > 0 {
+					writeR1Batch(batch, bufferedW1)
+				}
 				return
 			}
 		}
@@ -1073,7 +1113,7 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 			r2WriteDone <- true
 		}()
 
-		batch := make([]fastq.Sequence, 0, 1000)
+		batch := make([]fastq.Sequence, 0, 2000)
 
 		for {
 			select {
@@ -1087,27 +1127,32 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 
 				batch = append(batch, result.Seq2)
 
-				if len(batch) >= 1000 {
-					select {
-					case r1Batch := <-r1BatchReady:
-						writeR1Batch(r1Batch, bufferedW1)
-						writeR2Batch(batch, bufferedW2)
+				if len(batch) >= 2000 {
+					writeR2Batch(batch, bufferedW2)
 
-						mu.Lock()
-						totalOutputReads += len(batch)
-						for _, r := range r1Batch {
-							if containsPattern(string(r.Letters), pattern) {
-								keptPatternReads++
-							}
+					mu.Lock()
+					totalOutputReads += len(batch)
+					for _, r := range batch {
+						if containsPattern(string(r.Letters), pattern) {
+							keptPatternReads++
 						}
-						mu.Unlock()
-
-						batch = make([]fastq.Sequence, 0, 1000)
-					case <-stopWriting:
-						return
 					}
+					mu.Unlock()
+
+					batch = make([]fastq.Sequence, 0, 2000)
 				}
 			case <-stopWriting:
+				if len(batch) > 0 {
+					writeR2Batch(batch, bufferedW2)
+					mu.Lock()
+					totalOutputReads += len(batch)
+					for _, r := range batch {
+						if containsPattern(string(r.Letters), pattern) {
+							keptPatternReads++
+						}
+					}
+					mu.Unlock()
+				}
 				return
 			}
 		}
@@ -1117,9 +1162,14 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 	<-r1Done
 	<-r2Done
 	<-pairDone
+
+	// 关闭读取相关通道
 	close(stopReading)
-	close(stopProcessing)
 	close(readQueue)
+
+	// 等待所有worker完成
+	workerWg.Wait()
+	close(stopProcessing)
 
 	// 发送结束信号给输出线程
 	writeCache <- nil
@@ -1208,7 +1258,7 @@ func main() {
 	flag.StringVar(&pattern, "pattern", "AGCAGTGGTATCAACGCAGAGTACA", "Pattern to search for")
 	flag.StringVar(&outdir, "outdir", "", "Output directory")
 	flag.IntVar(&percent, "percent", 5, "Percentage of pattern reads to keep (0-100)")
-	//flag.IntVar(&numWorkers, "workers", 4, "Number of worker threads")
+	flag.IntVar(&numWorkers, "workers", 4, "Number of worker threads")
 	flag.StringVar(&pigzPath, "pigz", "", "Path to pigz executable for compression")
 	flag.BoolVar(&showVersion, "version", false, "Show version information")
 	flag.BoolVar(&useMmap, "mmap", false, "Use legacy pipeline mode (batch reading is now default)")
@@ -1216,7 +1266,7 @@ func main() {
 	// 解析命令行参数
 	flag.Parse()
 
-	numWorkers = 6
+	//numWorkers = 6
 	// 显示版本信息
 	if showVersion {
 		fmt.Printf("patternqc v%s (Build: %s)\n", Version, BuildTime)
