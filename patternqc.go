@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	Version   = "0.7.0"
+	Version   = "0.7.1"
 	BuildTime = "2025-08-29"
 )
 
@@ -1001,7 +1001,7 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 					return
 				}
 
-				// 批量配对
+				// 批量配对 - 确保R1和R2完全配对
 				minLen := len(r1Batch)
 				if len(r2Batch) < minLen {
 					minLen = len(r2Batch)
@@ -1039,6 +1039,12 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 					case <-stopReading:
 						return
 					}
+				}
+
+				// 检查并报告批次大小差异
+				if len(r1Batch) != len(r2Batch) {
+					fmt.Printf("Warning: R1 batch size (%d) != R2 batch size (%d), paired %d reads\n",
+						len(r1Batch), len(r2Batch), minLen)
 				}
 			case <-stopReading:
 				return
@@ -1096,6 +1102,16 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 
 				if len(batch) >= 2000 {
 					writeR1Batch(batch, bufferedW1)
+
+					mu.Lock()
+					totalOutputReads += len(batch)
+					for _, r := range batch {
+						if containsPattern(string(r.Letters), pattern) {
+							keptPatternReads++
+						}
+					}
+					mu.Unlock()
+
 					batch = make([]fastq.Sequence, 0, 2000)
 				}
 			case <-stopWriting:
