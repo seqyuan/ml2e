@@ -4,13 +4,11 @@
 
 ## 功能特性
 
-- **多线程处理**：支持多线程并行处理，提高处理速度
 - **压缩文件支持**：自动识别和处理 `.gz` 压缩文件
 - **Pattern 匹配**：支持正向和反向互补序列匹配
 - **灵活过滤**：可设置保留 pattern reads 的百分比
 - **高性能流水线**：使用10M reads批次处理，优化内存使用
 - **内存映射读取**：支持内存映射文件读取，大幅提升大文件处理性能
-- **多线程读取**：4个独立读取线程，提高I/O并发性
 - **批量处理**：支持批量写入，提高 I/O 性能
 - **进度显示**：实时显示处理进度
 - **统计报告**：生成详细的处理统计信息
@@ -21,10 +19,10 @@
 
 ```bash
 # 安装最新版本
-go install github.com/seqyuan/patternqc/v5@latest
+go install github.com/seqyuan/patternqc@latest
 
 # 安装特定版本
-go install github.com/seqyuan/patternqc/v5@v5.1.0
+go install github.com/seqyuan/patternqc@v0.6.0
 ```
 
 安装后，`patternqc` 命令会被安装到 `$GOPATH/bin` 目录中，确保该目录在你的 `PATH` 环境变量中。
@@ -76,7 +74,6 @@ patternqc
 
 - `-pattern`：要搜索的 pattern（默认：`AGCAGTGGTATCAACGCAGAGTACA`）
 - `-percent`：保留 pattern reads 的百分比（0-100，默认：5）
-- `-workers`：工作线程数（默认：4）
 - `-mmap`：使用内存映射文件读取模式，提升大文件处理性能
 - `-pigz`：pigz 可执行文件路径，用于压缩输出文件
 
@@ -89,7 +86,7 @@ patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result
 
 #### 自定义参数
 ```bash
-patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -percent 10 -workers 8
+patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -percent 10
 ```
 
 #### 自定义 pattern
@@ -145,18 +142,13 @@ patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -mmap -work
 7. **pigz 压缩**：可选的后处理压缩，使用 pigz 进行多线程压缩
 8. **pigz 路径**：如果使用 `-pigz` 参数，确保指定的 pigz 路径存在且可执行
 
-## 安装
-
-   ```bash
-   go install github.com/seqyuan/patternqc/v4@latest
-   ```
 
 ### 自动发布流程
 
 1. **创建新版本标签**：
    ```bash
-   git tag v1.1.0
-   git push origin v1.1.0
+   git tag v0.6.0
+   git push origin v0.6.0
    ```
 
 ## 技术支持
