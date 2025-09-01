@@ -1,4 +1,4 @@
-module github.com/seqyuan/patternqc/v5
+module github.com/seqyuan/patternqc
 
 go 1.21
 
