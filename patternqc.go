@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,7 +19,7 @@ import (
 )
 
 const (
-	Version   = "5.3.3"
+	Version   = "0.6.0"
 	BuildTime = "2024-12-19"
 )
 
@@ -197,268 +196,6 @@ func processReadPair(seq1, seq2 fastq.Sequence, pattern string, keepEveryN int, 
 	}
 }
 
-// Filter模式：过滤fq1和fq2，保留指定比例的pattern reads
-func filterMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, pigzPath string) error {
-	// 创建输出目录
-	if err := os.MkdirAll(outdir, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory: %v", err)
-	}
-
-	// 创建输入文件reader
-	reader1, file1, err := createReader(fq1)
-	if err != nil {
-		return err
-	}
-	defer file1.Close()
-
-	reader2, file2, err := createReader(fq2)
-	if err != nil {
-		return err
-	}
-	defer file2.Close()
-
-	// 创建fastq scanner
-	scanner1 := fastq.NewScanner(fastq.NewReader(reader1))
-	scanner2 := fastq.NewScanner(fastq.NewReader(reader2))
-
-	// 准备输出文件路径 - 保持原始扩展名，但移除.gz
-	basename1 := getBasename(fq1)
-	basename2 := getBasename(fq2)
-
-	// 输出文件使用.fq扩展名，不压缩
-	output1 := filepath.Join(outdir, basename1)
-	output2 := filepath.Join(outdir, basename2)
-
-	// 创建输出文件
-	writer1, outFile1, err := createWriter(output1)
-	if err != nil {
-		return err
-	}
-	defer outFile1.Close()
-
-	writer2, outFile2, err := createWriter(output2)
-	if err != nil {
-		return err
-	}
-	defer outFile2.Close()
-
-	// 创建fastq writer
-	w1 := fastq.NewWriter(writer1)
-	w2 := fastq.NewWriter(writer2)
-
-	// 创建高性能缓冲写入器
-	bufferedW1 := NewBufferedFastqWriter(w1, outFile1, 8*1024*1024) // 增加到8MB缓冲区
-	bufferedW2 := NewBufferedFastqWriter(w2, outFile2, 8*1024*1024) // 增加到8MB缓冲区
-	defer bufferedW1.Close()
-	defer bufferedW2.Close()
-
-	// 创建顺序队列和同步原语
-	queue := NewSimpleQueue()
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	totalReads := 0
-	patternReads := 0
-	keptPatternReads := 0
-	totalOutputReads := 0 // 新增：统计所有输出的reads
-
-	// 计算保留的pattern reads数量
-	keepEveryN := 100 / percent
-
-	// 创建worker池 - 无限制缓冲区
-	workChan := make(chan struct {
-		seq1 fastq.Sequence
-		seq2 fastq.Sequence
-	}, numWorkers*2000) // 进一步增加缓冲区，确保worker完全不被阻塞
-
-	// 启动worker goroutines - 高性能版本
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			processedCount := 0
-			for work := range workChan {
-				result := processReadPair(work.seq1, work.seq2, pattern, keepEveryN, &patternReads, &mu)
-				queue.Add(result)
-				processedCount++
-
-				// 每处理10000个reads输出一次worker状态
-				if processedCount%10000 == 0 {
-					fmt.Printf("Worker %d processed %d reads\n", workerID, processedCount)
-				}
-			}
-			fmt.Printf("Worker %d finished, total processed: %d\n", workerID, processedCount)
-		}(i)
-	}
-
-	// 启动多个输出goroutine - 真正的多线程输出
-	outputDone := make(chan bool)
-	numOutputWorkers := 4 // 使用4个输出线程
-
-	for i := 0; i < numOutputWorkers; i++ {
-		go func(outputWorkerID int) {
-			defer func() {
-				if outputWorkerID == 0 {
-					outputDone <- true
-				}
-			}()
-
-			// 每个输出线程处理自己的批次
-			batchSize := 1000000 // 恢复到100万个结果
-			batch := make([]*ProcessResult, 0, batchSize)
-
-			for {
-				results := queue.GetAll()
-				if results == nil {
-					// 队列已关闭且为空，处理剩余批次
-					if len(batch) > 0 {
-						writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
-						fmt.Printf("Output worker %d wrote final batch of %d results\n", outputWorkerID, len(batch))
-					}
-					break
-				}
-
-				// 如果有数据，添加到批次
-				if len(results) > 0 {
-					batch = append(batch, results...)
-				}
-
-				// 当批次满了时写入
-				if len(batch) >= batchSize {
-					writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
-					fmt.Printf("Output worker %d wrote batch of %d results\n", outputWorkerID, len(batch))
-					batch = batch[:0] // 清空批次
-				}
-
-				// 如果队列已关闭且批次不为空，立即写入
-				if queue.IsClosed() && len(batch) > 0 {
-					writeBatchOptimized(batch, bufferedW1, bufferedW2, &keptPatternReads, &totalOutputReads, &mu)
-					fmt.Printf("Output worker %d wrote remaining batch of %d results\n", outputWorkerID, len(batch))
-					batch = batch[:0]
-				}
-			}
-		}(i)
-	}
-
-	// 读取并分发工作 - 高性能版本
-	index := 0
-
-	for scanner1.Next() && scanner2.Next() {
-		seq1 := scanner1.Seq()
-		seq2 := scanner2.Seq()
-		totalReads++
-
-		// 发送工作到worker池 - 无阻塞版本
-		workChan <- struct {
-			seq1 fastq.Sequence
-			seq2 fastq.Sequence
-		}{seq1, seq2}
-
-		index++
-
-		// 每处理100000个reads输出一次进度，包括队列状态和内存使用
-		if totalReads%100000 == 0 {
-			queueLen := queue.Len()
-
-			// 获取内存使用情况
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
-
-			fmt.Printf("Processed %d reads, Queue: %d, Memory: %.2f GB\n",
-				totalReads, queueLen, float64(m.Alloc)/1024/1024/1024)
-
-			// 如果内存使用过高，强制垃圾回收（调整到50GB）
-			if m.Alloc > 50*1024*1024*1024 { // 超过50GB
-				fmt.Printf("High memory usage detected (%.2f GB), forcing garbage collection...\n",
-					float64(m.Alloc)/1024/1024/1024)
-				runtime.GC()
-			}
-		}
-	}
-
-	// 关闭工作通道
-	close(workChan)
-
-	// 等待所有worker完成
-	wg.Wait()
-
-	// 关闭队列
-	queue.Close()
-
-	// 等待输出完成，确保所有数据都写入
-	fmt.Printf("Waiting for output completion...\n")
-
-	// 等待所有输出goroutine完成
-	select {
-	case <-outputDone:
-		fmt.Println("Output completed successfully")
-	case <-time.After(30 * time.Second):
-		fmt.Printf("Warning: Output timeout after 30s, checking final status...\n")
-		queueLen := queue.Len()
-		fmt.Printf("Final queue status - Length: %d, Closed: %v\n", queueLen, queue.IsClosed())
-
-		// 强制等待更长时间，确保数据写入
-		select {
-		case <-outputDone:
-			fmt.Println("Output completed after extended wait")
-		case <-time.After(60 * time.Second):
-			fmt.Printf("Error: Output timeout after 90s total, some data may be lost\n")
-		}
-	}
-
-	// 强制刷新所有缓冲区
-	fmt.Println("Flushing all buffers...")
-	if err := bufferedW1.Flush(); err != nil {
-		fmt.Printf("Error flushing bufferedW1: %v\n", err)
-	}
-	if err := bufferedW2.Flush(); err != nil {
-		fmt.Printf("Error flushing bufferedW2: %v\n", err)
-	}
-
-	if err := scanner1.Error(); err != nil {
-		return fmt.Errorf("error reading fq1: %v", err)
-	}
-	if err := scanner2.Error(); err != nil {
-		return fmt.Errorf("error reading fq2: %v", err)
-	}
-
-	// 计算最终比例
-	finalRatio := 0.0
-	if totalReads > 0 {
-		finalRatio = float64(keptPatternReads) / float64(totalReads) * 100.0
-	}
-
-	// 输出统计结果
-	outputFile := filepath.Join(outdir, fmt.Sprintf("%s.stats.txt", basename2))
-	output, err := os.Create(outputFile)
-	if err != nil {
-		return fmt.Errorf("failed to create ratio file: %v", err)
-	}
-	defer output.Close()
-
-	fmt.Fprintf(output, "Total reads: %d\n", totalReads)
-	fmt.Fprintf(output, "Original pattern reads: %d\n", patternReads)
-	fmt.Fprintf(output, "Kept pattern reads: %d\n", keptPatternReads)
-	fmt.Fprintf(output, "Total output reads: %d\n", totalOutputReads) // 新增：总输出reads数
-	fmt.Fprintf(output, "Final ratio: %.2f%%\n", finalRatio)
-
-	fmt.Printf("Filter mode completed. Results saved to: %s\n", outputFile)
-	fmt.Printf("Filtered files saved to: %s and %s\n", output1, output2)
-	fmt.Printf("Total reads: %d, Kept pattern reads: %d, Total output reads: %d, Final ratio: %.2f%%\n",
-		totalReads, keptPatternReads, totalOutputReads, finalRatio)
-
-	// 如果指定了pigz路径，则压缩输出文件
-	if pigzPath != "" {
-		if err := compressWithPigz(output1, output2, pigzPath, numWorkers); err != nil {
-			log.Printf("Warning: Failed to compress output files with pigz: %v", err)
-		} else {
-			fmt.Printf("Output files compressed with pigz using %d threads\n", numWorkers)
-		}
-	}
-
-	return nil
-}
-
 // 使用pigz压缩文件
 func compressWithPigz(file1, file2, pigzPath string, numWorkers int) error {
 	// 检查pigz路径是否存在
@@ -466,14 +203,39 @@ func compressWithPigz(file1, file2, pigzPath string, numWorkers int) error {
 		return fmt.Errorf("pigz not found at path: %s", pigzPath)
 	}
 
-	// 压缩第一个文件
-	if err := compressFileWithPigz(file1, pigzPath, numWorkers); err != nil {
-		return fmt.Errorf("failed to compress %s: %v", file1, err)
-	}
+	// 使用goroutine同时压缩两个文件
+	var wg sync.WaitGroup
+	var err1, err2 error
 
-	// 压缩第二个文件
-	if err := compressFileWithPigz(file2, pigzPath, numWorkers); err != nil {
-		return fmt.Errorf("failed to compress %s: %v", file2, err)
+	wg.Add(2)
+
+	// 启动第一个文件的压缩
+	go func() {
+		defer wg.Done()
+		err1 = compressFileWithPigz(file1, pigzPath, numWorkers)
+		if err1 != nil {
+			err1 = fmt.Errorf("failed to compress %s: %v", file1, err1)
+		}
+	}()
+
+	// 启动第二个文件的压缩
+	go func() {
+		defer wg.Done()
+		err2 = compressFileWithPigz(file2, pigzPath, numWorkers)
+		if err2 != nil {
+			err2 = fmt.Errorf("failed to compress %s: %v", file2, err2)
+		}
+	}()
+
+	// 等待两个压缩任务完成
+	wg.Wait()
+
+	// 检查是否有错误发生
+	if err1 != nil {
+		return err1
+	}
+	if err2 != nil {
+		return err2
 	}
 
 	return nil
@@ -490,84 +252,6 @@ func compressFileWithPigz(filePath, pigzPath string, numWorkers int) error {
 
 	// 执行命令
 	return cmd.Run()
-}
-
-// 批量写入函数
-func writeBatch(batch []*ProcessResult, w1, w2 fastq.Writer, keptPatternReads *int, totalOutputReads *int, mu *sync.Mutex) {
-	for _, result := range batch {
-		if result.Keep {
-			// 写入fq1 - 确保写入完整的FASTQ记录（包括质量值）
-			if _, err := w1.Write(result.Seq1); err != nil {
-				log.Printf("error writing to fq1: %v", err)
-				return
-			}
-			// 写入fq2 - 确保写入完整的FASTQ记录（包括质量值）
-			if _, err := w2.Write(result.Seq2); err != nil {
-				log.Printf("error writing to fq2: %v", err)
-				return
-			}
-
-			// 统计所有输出的reads
-			mu.Lock()
-			*totalOutputReads++
-			if result.HasPattern {
-				*keptPatternReads++
-			}
-			mu.Unlock()
-		}
-	}
-}
-
-// 分离的写入函数 - 每个文件使用独立线程
-func writeBatchSeparate(batch []*ProcessResult, w1, w2 fastq.Writer, keptPatternReads *int, totalOutputReads *int, mu *sync.Mutex) {
-	// 分离R1和R2的数据
-	var r1Data, r2Data []fastq.Sequence
-
-	for _, result := range batch {
-		if result.Keep {
-			r1Data = append(r1Data, result.Seq1)
-			r2Data = append(r2Data, result.Seq2)
-		}
-	}
-
-	// 使用goroutine并行写入两个文件
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// 写入R1文件
-	go func() {
-		defer wg.Done()
-		for _, seq := range r1Data {
-			if _, err := w1.Write(seq); err != nil {
-				log.Printf("error writing to fq1: %v", err)
-				return
-			}
-		}
-	}()
-
-	// 写入R2文件
-	go func() {
-		defer wg.Done()
-		for _, seq := range r2Data {
-			if _, err := w2.Write(seq); err != nil {
-				log.Printf("error writing to fq2: %v", err)
-				return
-			}
-		}
-	}()
-
-	// 等待两个写入完成
-	wg.Wait()
-
-	// 统计输出
-	mu.Lock()
-	*totalOutputReads += len(r1Data)
-	for _, result := range batch {
-		if result.Keep && result.HasPattern {
-			*keptPatternReads++
-		}
-	}
-	mu.Unlock()
 }
 
 // 高性能缓冲写入器
@@ -624,67 +308,6 @@ func (bfw *BufferedFastqWriter) Close() error {
 		return err
 	}
 	return bfw.file.Close()
-}
-
-// 高性能分离写入函数
-func writeBatchOptimized(batch []*ProcessResult, w1, w2 *BufferedFastqWriter, keptPatternReads *int, totalOutputReads *int, mu *sync.Mutex) {
-	// 分离R1和R2的数据
-	var r1Data, r2Data []fastq.Sequence
-
-	for _, result := range batch {
-		if result.Keep {
-			r1Data = append(r1Data, result.Seq1)
-			r2Data = append(r2Data, result.Seq2)
-		}
-	}
-
-	// 使用goroutine并行写入两个文件
-	var wg sync.WaitGroup
-	var r1Err, r2Err error
-	wg.Add(2)
-
-	// 写入R1文件
-	go func() {
-		defer wg.Done()
-		for _, seq := range r1Data {
-			if err := w1.Write(seq); err != nil {
-				r1Err = err
-				log.Printf("error writing to fq1: %v", err)
-				return
-			}
-		}
-	}()
-
-	// 写入R2文件
-	go func() {
-		defer wg.Done()
-		for _, seq := range r2Data {
-			if err := w2.Write(seq); err != nil {
-				r2Err = err
-				log.Printf("error writing to fq2: %v", err)
-				return
-			}
-		}
-	}()
-
-	// 等待两个写入完成
-	wg.Wait()
-
-	// 检查错误
-	if r1Err != nil || r2Err != nil {
-		log.Printf("Write errors - R1: %v, R2: %v", r1Err, r2Err)
-		return
-	}
-
-	// 统计输出
-	mu.Lock()
-	*totalOutputReads += len(r1Data)
-	for _, result := range batch {
-		if result.Keep && result.HasPattern {
-			*keptPatternReads++
-		}
-	}
-	mu.Unlock()
 }
 
 // 借鉴fastp的内存池
@@ -852,7 +475,7 @@ func (sfw *SmartFastqWriter) serializeSequence(seq fastq.Sequence) []byte {
 }
 
 func usage() {
-	fmt.Printf("\nProgram: patternqc - FastQ filtering based on sequence pattern (Multi-threaded, Optimized)\n")
+	fmt.Printf("\nProgram: patternqc - FastQ filtering based on sequence pattern (use 6-8 threads)\n")
 	fmt.Printf("Usage: patternqc [options]\n\n")
 	fmt.Printf("Options:\n")
 	fmt.Printf("  -fq1        Input fastq file 1 (supports .gz format)\n")
@@ -860,13 +483,12 @@ func usage() {
 	fmt.Printf("  -pattern    Pattern to search for (default: AGCAGTGGTATCAACGCAGAGTACA)\n")
 	fmt.Printf("  -outdir     Output directory (required)\n")
 	fmt.Printf("  -percent    Percentage of pattern reads to keep (0-100, default: 5)\n")
-	fmt.Printf("  -workers    Number of worker threads (default: 4)\n")
 	fmt.Printf("  -mmap       Use legacy pipeline mode (batch reading is now default)\n")
 	fmt.Printf("  -pigz       Path to pigz executable for compression\n")
 	fmt.Printf("  -version    Show version information\n\n")
 	fmt.Printf("Examples:\n")
 	fmt.Printf("  patternqc -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output\n")
-	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -percent 10 -workers 8\n")
+	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -percent 5\n")
 	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz\n")
 	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output\n")
 	os.Exit(1)
@@ -982,7 +604,7 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 	scanner2 := fastq.NewScanner(fastq.NewReader(reader2))
 
 	// 统计变量
-	var totalReads, patternReads int64
+	var totalReads int64
 	var keptPatternReads, totalOutputReads int
 	var patternReadsInt int
 	var mu sync.Mutex
@@ -1168,16 +790,21 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 		return fmt.Errorf("error reading fq2 (%s): %v", fq2, err)
 	}
 
+	// 确保在输出统计之前获取最终的patternReads值
+	mu.Lock()
+	finalPatternReads := patternReadsInt
+	mu.Unlock()
+
 	// 计算最终比例
-	finalRatio := 0.0
+	pattern_sequence_keepRatio := 0.0
 	if totalReads > 0 {
-		finalRatio = float64(keptPatternReads) / float64(totalReads) * 100.0
+		pattern_sequence_keepRatio = float64(keptPatternReads) / float64(finalPatternReads) * 100.0
 	}
 
 	// 输出统计信息
 	statsFile := filepath.Join(outdir, basename2+".stats.txt")
-	statsContent := fmt.Sprintf("Total reads: %d\nOriginal pattern reads: %d\nKept pattern reads: %d\nTotal output reads: %d\nFinal ratio: %.2f%%\n",
-		totalReads, patternReads, keptPatternReads, totalOutputReads, finalRatio)
+	statsContent := fmt.Sprintf("Total reads: %d\nOriginal pattern reads: %d\nKept pattern reads: %d\nTotal output reads: %d\nPattern sequence keep ratio: %.2f%%\n",
+		totalReads, finalPatternReads, keptPatternReads, totalOutputReads, pattern_sequence_keepRatio)
 
 	if err := os.WriteFile(statsFile, []byte(statsContent), 0644); err != nil {
 		return fmt.Errorf("failed to write stats file: %v", err)
@@ -1186,8 +813,8 @@ func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWor
 	// 输出最终结果
 	fmt.Printf("\nOptimized pipeline mode completed. Results saved to: %s\n", statsFile)
 	fmt.Printf("Filtered files saved to: %s and %s\n", outFile1Path, outFile2Path)
-	fmt.Printf("Total reads: %d, Kept pattern reads: %d, Total output reads: %d, Final ratio: %.2f%%\n",
-		totalReads, keptPatternReads, totalOutputReads, finalRatio)
+	fmt.Printf("Total reads: %d, Kept pattern reads: %d, Total output reads: %d, Pattern sequence keep ratio: %.2f%%\n",
+		totalReads, keptPatternReads, totalOutputReads, pattern_sequence_keepRatio)
 
 	// 如果指定了pigz路径，进行压缩
 	if pigzPath != "" {
@@ -1252,7 +879,7 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 	defer bufferedW2.Close()
 
 	// 统计变量
-	var totalReads, patternReads int64
+	var totalReads int64
 	var keptPatternReads, totalOutputReads int
 	var patternReadsInt int
 	var mu sync.Mutex
@@ -1515,16 +1142,21 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 		fmt.Printf("Error flushing bufferedW2: %v\n", err)
 	}
 
+	// 确保在输出统计之前获取最终的patternReads值
+	mu.Lock()
+	finalPatternReads := patternReadsInt
+	mu.Unlock()
+
 	// 计算最终比例
-	finalRatio := 0.0
+	pattern_sequence_keepRatio := 0.0
 	if totalReads > 0 {
-		finalRatio = float64(keptPatternReads) / float64(totalReads) * 100.0
+		pattern_sequence_keepRatio = float64(keptPatternReads) / float64(finalPatternReads) * 100.0
 	}
 
 	// 输出统计信息
 	statsFile := filepath.Join(outdir, basename2+".stats.txt")
-	statsContent := fmt.Sprintf("Total reads: %d\nOriginal pattern reads: %d\nKept pattern reads: %d\nTotal output reads: %d\nFinal ratio: %.2f%%\n",
-		totalReads, patternReads, keptPatternReads, totalOutputReads, finalRatio)
+	statsContent := fmt.Sprintf("Total reads: %d\nOriginal pattern reads: %d\nKept pattern reads: %d\nTotal output reads: %d\nPattern sequence keep ratio: %.2f%%\n",
+		totalReads, finalPatternReads, keptPatternReads, totalOutputReads, pattern_sequence_keepRatio)
 
 	if err := os.WriteFile(statsFile, []byte(statsContent), 0644); err != nil {
 		return fmt.Errorf("failed to write stats file: %v", err)
@@ -1533,8 +1165,8 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 	// 输出最终结果
 	fmt.Printf("\nDual thread pipeline mode completed. Results saved to: %s\n", statsFile)
 	fmt.Printf("Filtered files saved to: %s and %s\n", outFile1Path, outFile2Path)
-	fmt.Printf("Total reads: %d, Kept pattern reads: %d, Total output reads: %d, Final ratio: %.2f%%\n",
-		totalReads, keptPatternReads, totalOutputReads, finalRatio)
+	fmt.Printf("Total reads: %d, Kept pattern reads: %d, Total output reads: %d, Pattern sequence keep ratio: %.2f%%\n",
+		totalReads, keptPatternReads, totalOutputReads, pattern_sequence_keepRatio)
 
 	// 如果指定了pigz路径，进行压缩
 	if pigzPath != "" {
@@ -1576,7 +1208,7 @@ func main() {
 	flag.StringVar(&pattern, "pattern", "AGCAGTGGTATCAACGCAGAGTACA", "Pattern to search for")
 	flag.StringVar(&outdir, "outdir", "", "Output directory")
 	flag.IntVar(&percent, "percent", 5, "Percentage of pattern reads to keep (0-100)")
-	flag.IntVar(&numWorkers, "workers", 4, "Number of worker threads")
+	//flag.IntVar(&numWorkers, "workers", 4, "Number of worker threads")
 	flag.StringVar(&pigzPath, "pigz", "", "Path to pigz executable for compression")
 	flag.BoolVar(&showVersion, "version", false, "Show version information")
 	flag.BoolVar(&useMmap, "mmap", false, "Use legacy pipeline mode (batch reading is now default)")
@@ -1584,6 +1216,7 @@ func main() {
 	// 解析命令行参数
 	flag.Parse()
 
+	numWorkers = 6
 	// 显示版本信息
 	if showVersion {
 		fmt.Printf("patternqc v%s (Build: %s)\n", Version, BuildTime)
