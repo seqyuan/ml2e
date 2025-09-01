@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	Version   = "0.6.0"
-	BuildTime = "2024-12-19"
+	Version   = "0.6.3"
+	BuildTime = "2025-08-29"
 )
 
 // 简化的结果结构 - 只需要配对信息
