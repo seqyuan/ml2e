@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"compress/gzip"
 	"flag"
 	"fmt"
@@ -13,13 +12,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/seqyuan/annogene/io/fastq"
 )
 
 const (
-	Version   = "0.7.1"
+	Version   = "0.8.0"
 	BuildTime = "2025-08-29"
 )
 
@@ -29,71 +27,6 @@ type ProcessResult struct {
 	Seq2       fastq.Sequence
 	HasPattern bool
 	Keep       bool
-}
-
-// 简化的队列 - 不需要顺序控制
-type SimpleQueue struct {
-	mu      sync.Mutex
-	results []*ProcessResult
-	closed  bool
-}
-
-func NewSimpleQueue() *SimpleQueue {
-	return &SimpleQueue{
-		results: make([]*ProcessResult, 0, 100000), // 预分配10万容量
-		closed:  false,
-	}
-}
-
-// 添加结果到队列 - 无顺序要求
-func (q *SimpleQueue) Add(result *ProcessResult) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	if q.closed {
-		return
-	}
-
-	q.results = append(q.results, result)
-}
-
-// 获取所有结果并清空队列
-func (q *SimpleQueue) GetAll() []*ProcessResult {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	if len(q.results) == 0 {
-		if q.closed {
-			return nil // 队列已关闭且为空
-		}
-		return []*ProcessResult{} // 返回空切片，表示暂时没有数据
-	}
-
-	// 返回所有结果并清空队列
-	results := q.results
-	q.results = make([]*ProcessResult, 0, 100000)
-	return results
-}
-
-// 关闭队列
-func (q *SimpleQueue) Close() {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.closed = true
-}
-
-// 获取队列长度
-func (q *SimpleQueue) Len() int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return len(q.results)
-}
-
-// 检查队列是否已关闭
-func (q *SimpleQueue) IsClosed() bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.closed
 }
 
 // 反向互补序列
@@ -322,170 +255,6 @@ func (bfw *BufferedFastqWriter) Close() error {
 	return bfw.file.Close()
 }
 
-// 借鉴fastp的内存池
-type MemoryPool struct {
-	pool sync.Pool
-	size int
-}
-
-func NewMemoryPool(size int) *MemoryPool {
-	return &MemoryPool{
-		pool: sync.Pool{
-			New: func() interface{} {
-				return make([]byte, 0, size)
-			},
-		},
-		size: size,
-	}
-}
-
-func (mp *MemoryPool) Get() []byte {
-	return mp.pool.Get().([]byte)
-}
-
-func (mp *MemoryPool) Put(buf []byte) {
-	// 重置缓冲区
-	buf = buf[:0]
-	mp.pool.Put(buf)
-}
-
-// 借鉴fastp的线程池设计
-type ThreadPool struct {
-	workers    int
-	taskQueue  chan interface{}
-	workerFunc func(interface{})
-	wg         sync.WaitGroup
-}
-
-func NewThreadPool(workers int, workerFunc func(interface{})) *ThreadPool {
-	tp := &ThreadPool{
-		workers:    workers,
-		taskQueue:  make(chan interface{}, workers*100),
-		workerFunc: workerFunc,
-	}
-
-	for i := 0; i < workers; i++ {
-		tp.wg.Add(1)
-		go tp.worker()
-	}
-
-	return tp
-}
-
-func (tp *ThreadPool) worker() {
-	defer tp.wg.Done()
-	for task := range tp.taskQueue {
-		tp.workerFunc(task)
-	}
-}
-
-func (tp *ThreadPool) Submit(task interface{}) {
-	tp.taskQueue <- task
-}
-
-func (tp *ThreadPool) Close() {
-	close(tp.taskQueue)
-	tp.wg.Wait()
-}
-
-// 借鉴fastp的智能写入器
-type SmartFastqWriter struct {
-	mu         sync.Mutex
-	buffers    map[string]*bytes.Buffer
-	writers    map[string]*BufferedFastqWriter
-	batchSize  int
-	flushTimer *time.Timer
-	memoryPool *MemoryPool
-}
-
-func NewSmartFastqWriter(w1, w2 *BufferedFastqWriter, batchSize int) *SmartFastqWriter {
-	sfw := &SmartFastqWriter{
-		buffers: map[string]*bytes.Buffer{
-			"R1": bytes.NewBuffer(make([]byte, 0, batchSize)),
-			"R2": bytes.NewBuffer(make([]byte, 0, batchSize)),
-		},
-		writers: map[string]*BufferedFastqWriter{
-			"R1": w1,
-			"R2": w2,
-		},
-		batchSize:  batchSize,
-		memoryPool: NewMemoryPool(batchSize),
-	}
-
-	// 设置定时刷新
-	sfw.flushTimer = time.AfterFunc(100*time.Millisecond, func() {
-		sfw.FlushAll()
-	})
-
-	return sfw
-}
-
-func (sfw *SmartFastqWriter) Write(fileType string, seq fastq.Sequence) error {
-	sfw.mu.Lock()
-	defer sfw.mu.Unlock()
-
-	buffer := sfw.buffers[fileType]
-
-	// 序列化序列
-	serialized := sfw.serializeSequence(seq)
-	buffer.Write(serialized)
-
-	// 检查是否需要刷新
-	if buffer.Len() >= sfw.batchSize {
-		return sfw.flushFile(fileType)
-	}
-
-	return nil
-}
-
-func (sfw *SmartFastqWriter) flushFile(fileType string) error {
-	buffer := sfw.buffers[fileType]
-	writer := sfw.writers[fileType]
-
-	if buffer.Len() == 0 {
-		return nil
-	}
-
-	// 直接写入文件，绕过fastq.Writer
-	data := buffer.Bytes()
-	_, err := writer.file.Write(data)
-	if err != nil {
-		return err
-	}
-
-	// 重置缓冲区
-	buffer.Reset()
-
-	return nil
-}
-
-func (sfw *SmartFastqWriter) FlushAll() error {
-	sfw.mu.Lock()
-	defer sfw.mu.Unlock()
-
-	for fileType := range sfw.buffers {
-		if err := sfw.flushFile(fileType); err != nil {
-			return err
-		}
-	}
-
-	// 重置定时器
-	sfw.flushTimer.Reset(100 * time.Millisecond)
-
-	return nil
-}
-
-func (sfw *SmartFastqWriter) serializeSequence(seq fastq.Sequence) []byte {
-	// 使用内存池获取缓冲区
-	buf := sfw.memoryPool.Get()
-	defer sfw.memoryPool.Put(buf)
-
-	// 序列化逻辑
-	// ... 实现序列化
-
-	return buf
-}
-
 func usage() {
 	fmt.Printf("\nProgram: patternqc - FastQ filtering based on sequence pattern (use 6-8 threads)\n")
 	fmt.Printf("Usage: patternqc [options]\n\n")
@@ -495,7 +264,6 @@ func usage() {
 	fmt.Printf("  -pattern    Pattern to search for (default: AGCAGTGGTATCAACGCAGAGTACA)\n")
 	fmt.Printf("  -outdir     Output directory (required)\n")
 	fmt.Printf("  -percent    Percentage of pattern reads to keep (0-100, default: 5)\n")
-	fmt.Printf("  -mmap       Use legacy pipeline mode (batch reading is now default)\n")
 	fmt.Printf("  -pigz       Path to pigz executable for compression\n")
 	fmt.Printf("  -version    Show version information\n\n")
 	fmt.Printf("Examples:\n")
@@ -506,340 +274,14 @@ func usage() {
 	os.Exit(1)
 }
 
-// 新的流水线架构 - 分离读取、处理、写入
-type PipelineArchitecture struct {
-	// 配置参数
-	batchSize       int // 每批次reads数量 (5M)
-	maxCacheBatches int // 最大缓存批次数量 (300)
-
-	// 读取相关
-	scanner1, scanner2 *fastq.Scanner
-
-	// 处理相关
-	workers     int
-	workChan    chan *ReadBatch
-	processChan chan *ProcessedBatch
-
-	// 写入相关
-	writeChan chan *WriteBatch
-	writeDone chan bool
-
-	// 统计
-	totalReads       int64
-	patternReads     int64
-	keptPatternReads int64
-	totalOutputReads int64
-
-	// 同步
-	wg sync.WaitGroup
-	mu sync.Mutex
-}
-
-// 读取批次
-type ReadBatch struct {
-	ID       int
-	Reads    []ReadPair
-	Complete bool
-}
-
-// 处理后的批次
-type ProcessedBatch struct {
-	ID       int
-	Results  []*ProcessResult
-	Complete bool
-}
-
-// 写入批次
-type WriteBatch struct {
-	ID       int
-	R1Data   []fastq.Sequence
-	R2Data   []fastq.Sequence
-	Complete bool
-}
-
 // 读取对
 type ReadPair struct {
 	Seq1 fastq.Sequence
 	Seq2 fastq.Sequence
 }
 
-// 高性能流水线模式 - 双读取线程、实时处理、双输出线程
-func optimizedPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, pigzPath string) error {
-	// 创建输出目录
-	if err := os.MkdirAll(outdir, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory: %v", err)
-	}
-
-	// 创建输入文件reader
-	reader1, file1, err := createReader(fq1)
-	if err != nil {
-		return err
-	}
-	defer file1.Close()
-
-	reader2, file2, err := createReader(fq2)
-	if err != nil {
-		return err
-	}
-	defer file2.Close()
-
-	// 创建输出文件
-	basename1 := getBasename(fq1)
-	basename2 := getBasename(fq2)
-	outFile1Path := filepath.Join(outdir, basename1)
-	outFile2Path := filepath.Join(outdir, basename2)
-
-	writer1, outFile1, err := createWriter(outFile1Path)
-	if err != nil {
-		return err
-	}
-	defer outFile1.Close()
-
-	writer2, outFile2, err := createWriter(outFile2Path)
-	if err != nil {
-		return err
-	}
-	defer outFile2.Close()
-
-	// 创建fastq writer
-	w1 := fastq.NewWriter(writer1)
-	w2 := fastq.NewWriter(writer2)
-
-	// 创建高性能缓冲写入器
-	bufferedW1 := NewBufferedFastqWriter(w1, outFile1, 8*1024*1024) // 8MB缓冲区
-	bufferedW2 := NewBufferedFastqWriter(w2, outFile2, 8*1024*1024) // 8MB缓冲区
-	defer bufferedW1.Close()
-	defer bufferedW2.Close()
-
-	// 创建scanner
-	scanner1 := fastq.NewScanner(fastq.NewReader(reader1))
-	scanner2 := fastq.NewScanner(fastq.NewReader(reader2))
-
-	// 统计变量
-	var totalReads int64
-	var keptPatternReads, totalOutputReads int
-	var patternReadsInt int
-	var mu sync.Mutex
-
-	// 计算保留的pattern reads数量
-	keepEveryN := 100 / percent
-
-	// 创建写入缓存池 - 10M reads容量
-	writeCache := make(chan *ProcessResult, 10000000) // 10M容量
-	defer close(writeCache)
-
-	// 创建读取队列 - 用于worker处理
-	readQueue := make(chan ReadPair, 100000) // 10万容量
-	defer close(readQueue)
-
-	// 创建控制通道
-	r2Queue := make(chan fastq.Sequence, 100000) // R2数据队列
-	stopReading := make(chan bool)
-	stopProcessing := make(chan bool)
-	stopWriting := make(chan bool)
-
-	// 启动R1读取线程
-	r1Done := make(chan bool)
-	go func() {
-		defer func() {
-			r1Done <- true
-		}()
-
-		for scanner1.Next() {
-			seq1 := scanner1.Seq()
-
-			// 等待R2线程提供对应的seq2
-			select {
-			case r2Data := <-r2Queue:
-				// 将read pair发送到处理队列
-				select {
-				case readQueue <- ReadPair{Seq1: seq1, Seq2: r2Data}:
-					currentReads := atomic.AddInt64(&totalReads, 1)
-
-					// 每读取2M reads输出进度
-					if currentReads%2000000 == 0 {
-						fmt.Printf("Read %d reads\n", currentReads)
-					}
-				case <-stopReading:
-					return
-				}
-			case <-stopReading:
-				return
-			}
-		}
-	}()
-
-	// 启动R2读取线程
-	r2Done := make(chan bool)
-	go func() {
-		defer func() {
-			r2Done <- true
-		}()
-
-		for scanner2.Next() {
-			seq2 := scanner2.Seq()
-
-			// 将R2数据发送到R1线程
-			select {
-			case r2Queue <- seq2:
-			case <-stopReading:
-				return
-			}
-		}
-	}()
-
-	// 启动worker线程池
-	workerDone := make(chan bool)
-	for i := 0; i < numWorkers; i++ {
-		go func(workerID int) {
-			defer func() {
-				if workerID == 0 {
-					workerDone <- true
-				}
-			}()
-
-			for readPair := range readQueue {
-				result := processReadPair(readPair.Seq1, readPair.Seq2, pattern, keepEveryN, &patternReadsInt, &mu)
-
-				// 只有需要保留的reads才放入写入缓存池
-				if result.Keep {
-					select {
-					case writeCache <- result:
-					case <-stopProcessing:
-						return
-					}
-				}
-			}
-		}(i)
-	}
-
-	// 启动统一的输出线程 - 修复死锁问题
-	writeDone := make(chan bool)
-	go func() {
-		defer func() {
-			writeDone <- true
-		}()
-
-		r1Batch := make([]fastq.Sequence, 0, 2000)
-		r2Batch := make([]fastq.Sequence, 0, 2000)
-
-		for {
-			select {
-			case result := <-writeCache:
-				if result == nil {
-					// 结束信号
-					if len(r1Batch) > 0 {
-						writeR1Batch(r1Batch, bufferedW1)
-						writeR2Batch(r2Batch, bufferedW2)
-
-						// 更新统计
-						mu.Lock()
-						totalOutputReads += len(r1Batch)
-						for _, r := range r1Batch {
-							if containsPattern(string(r.Letters), pattern) {
-								keptPatternReads++
-							}
-						}
-						mu.Unlock()
-					}
-					return
-				}
-
-				r1Batch = append(r1Batch, result.Seq1)
-				r2Batch = append(r2Batch, result.Seq2)
-
-				// 当达到2000条时，同步写入
-				if len(r1Batch) >= 2000 {
-					writeR1Batch(r1Batch, bufferedW1)
-					writeR2Batch(r2Batch, bufferedW2)
-
-					// 更新统计
-					mu.Lock()
-					totalOutputReads += len(r1Batch)
-					for _, r := range r1Batch {
-						if containsPattern(string(r.Letters), pattern) {
-							keptPatternReads++
-						}
-					}
-					mu.Unlock()
-
-					r1Batch = make([]fastq.Sequence, 0, 2000)
-					r2Batch = make([]fastq.Sequence, 0, 2000)
-				}
-			case <-stopWriting:
-				return
-			}
-		}
-	}()
-
-	// 等待所有线程完成
-	<-r1Done
-	<-r2Done
-	close(stopReading)
-	close(stopProcessing)
-	close(readQueue)
-
-	// 发送结束信号给输出线程
-	writeCache <- nil
-
-	<-writeDone
-	close(stopWriting)
-
-	// 强制刷新缓冲区
-	fmt.Println("Flushing all buffers...")
-	if err := bufferedW1.Flush(); err != nil {
-		fmt.Printf("Error flushing bufferedW1: %v\n", err)
-	}
-	if err := bufferedW2.Flush(); err != nil {
-		fmt.Printf("Error flushing bufferedW2: %v\n", err)
-	}
-
-	// 检查错误
-	if err := scanner1.Error(); err != nil {
-		return fmt.Errorf("error reading fq1 (%s): %v", fq1, err)
-	}
-	if err := scanner2.Error(); err != nil {
-		return fmt.Errorf("error reading fq2 (%s): %v", fq2, err)
-	}
-
-	// 确保在输出统计之前获取最终的patternReads值
-	mu.Lock()
-	finalPatternReads := patternReadsInt
-	mu.Unlock()
-
-	// 计算最终比例
-	pattern_sequence_keepRatio := 0.0
-	if totalReads > 0 {
-		pattern_sequence_keepRatio = float64(keptPatternReads) / float64(finalPatternReads) * 100.0
-	}
-
-	// 输出统计信息
-	statsFile := filepath.Join(outdir, basename2+".stats.txt")
-	statsContent := fmt.Sprintf("Total reads: %d\nOriginal pattern reads: %d\nKept pattern reads: %d\nTotal output reads: %d\nPattern sequence keep ratio: %.2f%%\n",
-		totalReads, finalPatternReads, keptPatternReads, totalOutputReads, pattern_sequence_keepRatio)
-
-	if err := os.WriteFile(statsFile, []byte(statsContent), 0644); err != nil {
-		return fmt.Errorf("failed to write stats file: %v", err)
-	}
-
-	// 输出最终结果
-	fmt.Printf("\nOptimized pipeline mode completed. Results saved to: %s\n", statsFile)
-	fmt.Printf("Filtered files saved to: %s and %s\n", outFile1Path, outFile2Path)
-	fmt.Printf("Total reads: %d, Kept pattern reads: %d, Total output reads: %d, Pattern sequence keep ratio: %.2f%%\n",
-		totalReads, keptPatternReads, totalOutputReads, pattern_sequence_keepRatio)
-
-	// 如果指定了pigz路径，进行压缩
-	if pigzPath != "" {
-		if err := compressWithPigz(outFile1Path, outFile2Path, pigzPath, numWorkers); err != nil {
-			return fmt.Errorf("failed to compress output files: %v", err)
-		}
-	}
-
-	return nil
-}
-
-// 双线程并行读取模式 - 优化版本：worker批量处理
-func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, pigzPath string) error {
+// 高性能批量读取流水线模式 - 动态缓存机制
+func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, pigzPath string) error {
 	// 创建输出目录
 	if err := os.MkdirAll(outdir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %v", err)
@@ -899,14 +341,29 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 	// 计算保留的pattern reads数量
 	keepEveryN := 100 / percent
 
-	// 优化配置：worker批量处理大小
-	const workerBatchSize = 500 // 每个worker一次处理500条reads
-	const readBatchSize = 10000 // 读取批次大小保持10万
+	// 动态缓存配置 - 根据worker数量和系统性能优化
+	const workerBatchSize = 1000 // 每个worker一次处理1000条reads
+	const readBatchSize = 20000  // 读取批次大小20K
 
-	// 根据worker批量处理大小调整缓存池容量
-	// 假设每个worker处理500条，6个worker，需要3倍缓冲
-	writeCacheCapacity := int64(numWorkers) * workerBatchSize * 3
-	readQueueCapacity := int64(numWorkers) * workerBatchSize * 2
+	// 智能缓存容量计算
+	// 写入缓存：worker数量 * 批处理大小 * 缓冲倍数(3-5倍)
+	writeCacheMultiplier := 4
+	if numWorkers <= 4 {
+		writeCacheMultiplier = 5 // 少worker时增加缓冲
+	} else if numWorkers >= 8 {
+		writeCacheMultiplier = 3 // 多worker时减少缓冲
+	}
+	writeCacheCapacity := int64(numWorkers) * workerBatchSize * int64(writeCacheMultiplier)
+
+	// 读取队列：worker数量 * 批处理大小 * 缓冲倍数(2-3倍)
+	readQueueMultiplier := 2
+	if numWorkers <= 4 {
+		readQueueMultiplier = 3 // 少worker时增加缓冲
+	}
+	readQueueCapacity := int64(numWorkers) * workerBatchSize * int64(readQueueMultiplier)
+
+	// 批量读取队列：固定大小，避免内存过度使用
+	const batchQueueSize = 10
 
 	// 创建写入缓存池，根据worker批量处理调整容量
 	writeCache := make(chan *ProcessResult, writeCacheCapacity)
@@ -920,8 +377,8 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 	stopWriting := make(chan bool)
 
 	// 批量读取配置
-	r1BatchQueue := make(chan []fastq.Sequence, 10)
-	r2BatchQueue := make(chan []fastq.Sequence, 10)
+	r1BatchQueue := make(chan []fastq.Sequence, batchQueueSize)
+	r2BatchQueue := make(chan []fastq.Sequence, batchQueueSize)
 
 	// 启动R1批量读取线程
 	r1Done := make(chan bool)
@@ -1079,96 +536,60 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 		}(i)
 	}
 
-	// 启动输出线程
-	r1WriteDone := make(chan bool)
+	// 启动同步输出线程 - 确保R1和R2写入同步
+	writeDone := make(chan bool)
 	go func() {
 		defer func() {
-			r1WriteDone <- true
+			writeDone <- true
 		}()
 
-		batch := make([]fastq.Sequence, 0, 2000)
+		r1Batch := make([]fastq.Sequence, 0, 5000)
+		r2Batch := make([]fastq.Sequence, 0, 5000)
 
 		for {
 			select {
 			case result := <-writeCache:
 				if result == nil {
-					if len(batch) > 0 {
-						writeR1Batch(batch, bufferedW1)
+					// 结束信号
+					if len(r1Batch) > 0 {
+						writeR1Batch(r1Batch, bufferedW1)
+						writeR2Batch(r2Batch, bufferedW2)
+
+						// 更新统计
+						mu.Lock()
+						totalOutputReads += len(r1Batch)
+						for _, r := range r1Batch {
+							if containsPattern(string(r.Letters), pattern) {
+								keptPatternReads++
+							}
+						}
+						mu.Unlock()
 					}
 					return
 				}
 
-				batch = append(batch, result.Seq1)
+				r1Batch = append(r1Batch, result.Seq1)
+				r2Batch = append(r2Batch, result.Seq2)
 
-				if len(batch) >= 2000 {
-					writeR1Batch(batch, bufferedW1)
+				// 当达到5000条时，同步写入
+				if len(r1Batch) >= 5000 {
+					writeR1Batch(r1Batch, bufferedW1)
+					writeR2Batch(r2Batch, bufferedW2)
 
+					// 更新统计
 					mu.Lock()
-					totalOutputReads += len(batch)
-					for _, r := range batch {
+					totalOutputReads += len(r1Batch)
+					for _, r := range r1Batch {
 						if containsPattern(string(r.Letters), pattern) {
 							keptPatternReads++
 						}
 					}
 					mu.Unlock()
 
-					batch = make([]fastq.Sequence, 0, 2000)
+					r1Batch = make([]fastq.Sequence, 0, 5000)
+					r2Batch = make([]fastq.Sequence, 0, 5000)
 				}
 			case <-stopWriting:
-				if len(batch) > 0 {
-					writeR1Batch(batch, bufferedW1)
-				}
-				return
-			}
-		}
-	}()
-
-	r2WriteDone := make(chan bool)
-	go func() {
-		defer func() {
-			r2WriteDone <- true
-		}()
-
-		batch := make([]fastq.Sequence, 0, 2000)
-
-		for {
-			select {
-			case result := <-writeCache:
-				if result == nil {
-					if len(batch) > 0 {
-						writeR2Batch(batch, bufferedW2)
-					}
-					return
-				}
-
-				batch = append(batch, result.Seq2)
-
-				if len(batch) >= 2000 {
-					writeR2Batch(batch, bufferedW2)
-
-					mu.Lock()
-					totalOutputReads += len(batch)
-					for _, r := range batch {
-						if containsPattern(string(r.Letters), pattern) {
-							keptPatternReads++
-						}
-					}
-					mu.Unlock()
-
-					batch = make([]fastq.Sequence, 0, 2000)
-				}
-			case <-stopWriting:
-				if len(batch) > 0 {
-					writeR2Batch(batch, bufferedW2)
-					mu.Lock()
-					totalOutputReads += len(batch)
-					for _, r := range batch {
-						if containsPattern(string(r.Letters), pattern) {
-							keptPatternReads++
-						}
-					}
-					mu.Unlock()
-				}
 				return
 			}
 		}
@@ -1189,11 +610,9 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 
 	// 发送结束信号给输出线程
 	writeCache <- nil
-	writeCache <- nil
 
 	// 等待输出线程完成
-	<-r1WriteDone
-	<-r2WriteDone
+	<-writeDone
 	close(stopWriting)
 
 	// 关闭通道
@@ -1229,7 +648,7 @@ func dualThreadPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWo
 	}
 
 	// 输出最终结果
-	fmt.Printf("\nDual thread pipeline mode completed. Results saved to: %s\n", statsFile)
+	fmt.Printf("\nHigh-performance batch reading pipeline completed. Results saved to: %s\n", statsFile)
 	fmt.Printf("Filtered files saved to: %s and %s\n", outFile1Path, outFile2Path)
 	fmt.Printf("Total reads: %d, Kept pattern reads: %d, Total output reads: %d, Pattern sequence keep ratio: %.2f%%\n",
 		totalReads, keptPatternReads, totalOutputReads, pattern_sequence_keepRatio)
@@ -1267,7 +686,6 @@ func main() {
 	var fq1, fq2, pattern, outdir, pigzPath string
 	var percent, numWorkers int
 	var showVersion bool
-	var useMmap bool
 
 	flag.StringVar(&fq1, "fq1", "", "Input fastq file 1 (supports .gz format)")
 	flag.StringVar(&fq2, "fq2", "", "Input fastq file 2 (supports .gz format)")
@@ -1277,12 +695,10 @@ func main() {
 	flag.IntVar(&numWorkers, "workers", 4, "Number of worker threads")
 	flag.StringVar(&pigzPath, "pigz", "", "Path to pigz executable for compression")
 	flag.BoolVar(&showVersion, "version", false, "Show version information")
-	flag.BoolVar(&useMmap, "mmap", false, "Use legacy pipeline mode (batch reading is now default)")
 
 	// 解析命令行参数
 	flag.Parse()
 
-	//numWorkers = 6
 	// 显示版本信息
 	if showVersion {
 		fmt.Printf("patternqc v%s (Build: %s)\n", Version, BuildTime)
@@ -1305,15 +721,9 @@ func main() {
 		usage()
 	}
 
-	// 根据参数选择执行模式
-	var err error
-	if useMmap {
-		fmt.Println("Using legacy pipeline mode...")
-		err = optimizedPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
-	} else {
-		fmt.Println("Using batch reading pipeline mode...")
-		err = dualThreadPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
-	}
+	// 执行高性能批量读取流水线模式
+	fmt.Println("Starting high-performance batch reading pipeline...")
+	err := mainPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 	}
