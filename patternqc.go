@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"compress/gzip"
 	"flag"
 	"fmt"
@@ -17,7 +18,7 @@ import (
 )
 
 const (
-	Version   = "0.8.1"
+	Version   = "0.10.0"
 	BuildTime = "2025-08-29"
 )
 
@@ -77,13 +78,14 @@ func createReader(filePath string) (io.Reader, *os.File, error) {
 
 	// 检查是否为gz文件
 	if strings.HasSuffix(filePath, ".gz") {
-		// 使用gzip reader
+		// 使用gzip reader，增加缓冲区大小
 		gz, err := gzip.NewReader(file)
 		if err != nil {
 			file.Close()
 			return nil, nil, fmt.Errorf("failed to create gzip reader for %s: %v", filePath, err)
 		}
-		reader = gz
+		// 使用更大的缓冲区包装gzip reader
+		reader = bufio.NewReaderSize(gz, 1024*1024) // 1MB缓冲区
 	}
 
 	return reader, file, nil
@@ -105,18 +107,15 @@ func createWriter(filePath string) (io.Writer, *os.File, error) {
 	return file, file, nil
 }
 
-// 处理单个read pair的worker函数
-func processReadPair(seq1, seq2 fastq.Sequence, pattern string, keepEveryN int, patternCount *int, mu *sync.Mutex) *ProcessResult {
+// 处理单个read pair的worker函数 - 修复竞态条件
+func processReadPair(seq1, seq2 fastq.Sequence, pattern string, keepEveryN int, patternCount *int64, mu *sync.Mutex) *ProcessResult {
 	hasPattern := containsPattern(string(seq2.Letters), pattern)
 
 	var keep bool
 	if hasPattern {
-		mu.Lock()
-		*patternCount++
-		currentCount := *patternCount
-		mu.Unlock()
-
-		keep = currentCount%keepEveryN == 0
+		// 使用原子操作获取当前计数
+		currentCount := atomic.AddInt64(patternCount, 1)
+		keep = currentCount%int64(keepEveryN) == 0
 	} else {
 		keep = true // 不包含pattern的read直接保留
 	}
@@ -130,7 +129,7 @@ func processReadPair(seq1, seq2 fastq.Sequence, pattern string, keepEveryN int, 
 }
 
 // 批量处理reads的worker函数
-func processReadPairBatch(readPairs []ReadPair, pattern string, keepEveryN int, patternCount *int, mu *sync.Mutex) []*ProcessResult {
+func processReadPairBatch(readPairs []ReadPair, pattern string, keepEveryN int, patternCount *int64, mu *sync.Mutex) []*ProcessResult {
 	results := make([]*ProcessResult, 0, len(readPairs))
 
 	for _, readPair := range readPairs {
@@ -186,6 +185,38 @@ func compressWithPigz(file1, file2, pigzPath string, numWorkers int) error {
 	return nil
 }
 
+// 使用pigz解压缩gzip文件
+func decompressWithPigz(filePath, pigzPath string, numWorkers int) (string, error) {
+	// 检查pigz路径是否存在
+	if _, err := os.Stat(pigzPath); os.IsNotExist(err) {
+		return filePath, fmt.Errorf("pigz not found at path: %s", pigzPath)
+	}
+
+	// 创建临时文件
+	tempFile, err := os.CreateTemp("", "patternqc_*.fq")
+	if err != nil {
+		return filePath, fmt.Errorf("failed to create temp file: %v", err)
+	}
+	tempFilePath := tempFile.Name()
+	tempFile.Close()
+
+	// 构建pigz命令
+	cmd := exec.Command(pigzPath, "-d", "-p", fmt.Sprintf("%d", numWorkers), "-o", tempFilePath, filePath)
+
+	// 设置输出
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// 执行解压缩
+	if err := cmd.Run(); err != nil {
+		os.Remove(tempFilePath) // 清理临时文件
+		return filePath, fmt.Errorf("failed to decompress %s: %v", filePath, err)
+	}
+
+	fmt.Printf("Decompressed %s to %s using pigz\n", filePath, tempFilePath)
+	return tempFilePath, nil
+}
+
 // 使用pigz压缩单个文件
 func compressFileWithPigz(filePath, pigzPath string, numWorkers int) error {
 	// 构建pigz命令
@@ -199,14 +230,14 @@ func compressFileWithPigz(filePath, pigzPath string, numWorkers int) error {
 	return cmd.Run()
 }
 
-// 高性能缓冲写入器
+// 高性能缓冲写入器 - 优化锁粒度
 type BufferedFastqWriter struct {
 	mu      sync.Mutex
 	buffer  []byte
 	writer  fastq.Writer
 	file    *os.File
 	maxSize int
-	written int64
+	written int64 // 使用int64支持原子操作
 }
 
 func NewBufferedFastqWriter(writer fastq.Writer, file *os.File, bufferSize int) *BufferedFastqWriter {
@@ -219,19 +250,25 @@ func NewBufferedFastqWriter(writer fastq.Writer, file *os.File, bufferSize int) 
 }
 
 func (bfw *BufferedFastqWriter) Write(seq fastq.Sequence) error {
-	bfw.mu.Lock()
-	defer bfw.mu.Unlock()
+	// 使用原子操作更新统计，减少锁竞争
+	written := atomic.AddInt64(&bfw.written, 1)
 
-	// 直接使用fastq.Writer，它已经处理了序列化
-	if _, err := bfw.writer.Write(seq); err != nil {
-		return err
+	// 只在需要刷新时获取锁
+	if written%100000 == 0 {
+		bfw.mu.Lock()
+		defer bfw.mu.Unlock()
+
+		// 直接使用fastq.Writer，它已经处理了序列化
+		if _, err := bfw.writer.Write(seq); err != nil {
+			return err
+		}
+
+		return bfw.flush()
 	}
 
-	bfw.written++
-
-	// 定期刷新缓冲区 - 减少刷新频率，提高I/O效率
-	if bfw.written%50000 == 0 {
-		return bfw.flush()
+	// 大部分情况下不需要锁，直接写入
+	if _, err := bfw.writer.Write(seq); err != nil {
+		return err
 	}
 
 	return nil
@@ -264,12 +301,15 @@ func usage() {
 	fmt.Printf("  -pattern    Pattern to search for (default: AGCAGTGGTATCAACGCAGAGTACA)\n")
 	fmt.Printf("  -outdir     Output directory (required)\n")
 	fmt.Printf("  -percent    Percentage of pattern reads to keep (0-100, default: 5)\n")
+	fmt.Printf("  -workers    Number of worker threads (default: 4, recommend 6-8)\n")
 	fmt.Printf("  -pigz       Path to pigz executable for compression\n")
+	fmt.Printf("  -pigz-decompress  Use pigz for decompression (faster for gzip files)\n")
 	fmt.Printf("  -version    Show version information\n\n")
 	fmt.Printf("Examples:\n")
 	fmt.Printf("  patternqc -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output\n")
 	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -percent 5\n")
 	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz\n")
+	fmt.Printf("  patternqc -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz -pigz-decompress\n")
 	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output\n")
 	os.Exit(1)
 }
@@ -327,23 +367,23 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 	w2 := fastq.NewWriter(writer2)
 
 	// 创建高性能缓冲写入器，增加缓冲区大小
-	bufferedW1 := NewBufferedFastqWriter(w1, outFile1, 32*1024*1024) // 32MB缓冲区（增加100%）
-	bufferedW2 := NewBufferedFastqWriter(w2, outFile2, 32*1024*1024) // 32MB缓冲区（增加100%）
+	bufferedW1 := NewBufferedFastqWriter(w1, outFile1, 64*1024*1024) // 64MB缓冲区（增加100%）
+	bufferedW2 := NewBufferedFastqWriter(w2, outFile2, 64*1024*1024) // 64MB缓冲区（增加100%）
 	defer bufferedW1.Close()
 	defer bufferedW2.Close()
 
 	// 统计变量
 	var totalReads int64
-	var keptPatternReads, totalOutputReads int
-	var patternReadsInt int
+	var keptPatternReads, totalOutputReads int64
+	var patternReadsInt int64
 	var mu sync.Mutex
 
 	// 计算保留的pattern reads数量
 	keepEveryN := 100 / percent
 
-	// 动态缓存配置 - 根据worker数量和系统性能优化
-	const workerBatchSize = 2000 // 每个worker一次处理2000条reads（增加100%）
-	const readBatchSize = 50000  // 读取批次大小50K（增加150%）
+	// 动态缓存配置 - 针对gzip文件优化
+	const workerBatchSize = 2000 // 每个worker一次处理2000条reads
+	const readBatchSize = 50000  // 读取批次大小50K（gzip文件不宜过大）
 
 	// 智能缓存容量计算 - 针对高worker数量优化
 	// 写入缓存：worker数量 * 批处理大小 * 缓冲倍数(2-3倍)
@@ -362,8 +402,25 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 	}
 	readQueueCapacity := int64(numWorkers) * workerBatchSize * int64(readQueueMultiplier)
 
-	// 批量读取队列：固定大小，避免内存过度使用
-	const batchQueueSize = 10
+	// 动态写入批次大小 - 基于worker数量优化，减少内存积累
+	writeBatchSize := numWorkers * 500 // 每个worker贡献500条reads（减少50%）
+	if writeBatchSize < 3000 {
+		writeBatchSize = 3000 // 最小保证3000条
+	} else if writeBatchSize > 10000 {
+		writeBatchSize = 10000 // 最大限制10000条
+	}
+
+	// 批量读取配置 - 针对gzip文件优化
+	const batchQueueSize = 15 // 适中的队列大小，避免gzip读取阻塞
+
+	// 输出配置信息
+	fmt.Printf("Configuration: workers=%d, read_batch=%d, worker_batch=%d, write_batch=%d\n",
+		numWorkers, readBatchSize, workerBatchSize, writeBatchSize)
+
+	// 检测gzip文件并输出优化提示
+	if strings.HasSuffix(fq1, ".gz") || strings.HasSuffix(fq2, ".gz") {
+		fmt.Printf("Gzip files detected - using optimized gzip reading strategy\n")
+	}
 
 	// 创建写入缓存池，根据worker批量处理调整容量
 	writeCache := make(chan *ProcessResult, writeCacheCapacity)
@@ -536,28 +593,71 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 		}(i)
 	}
 
-	// 启动同步输出线程 - 确保R1和R2写入同步
+	// 启动单函数双协程输出 - 修复通道关闭时机问题
 	writeDone := make(chan bool)
 	go func() {
 		defer func() {
 			writeDone <- true
 		}()
 
-		r1Batch := make([]fastq.Sequence, 0, 10000) // 增加写入批次到10K
-		r2Batch := make([]fastq.Sequence, 0, 10000) // 增加写入批次到10K
+		// 共享的写入缓存通道
+		writeCacheForR1 := make(chan *ProcessResult, writeCacheCapacity)
+		writeCacheForR2 := make(chan *ProcessResult, writeCacheCapacity)
 
-		for {
-			select {
-			case result := <-writeCache:
+		// 使用WaitGroup确保所有协程完成后再关闭通道
+		var wg sync.WaitGroup
+		wg.Add(2) // R1和R2协程
+
+		// 启动数据分发协程
+		go func() {
+			defer func() {
+				// 等待R1和R2协程完成后再关闭通道
+				wg.Wait()
+				close(writeCacheForR1)
+				close(writeCacheForR2)
+			}()
+
+			for {
+				select {
+				case result := <-writeCache:
+					if result == nil {
+						// 结束信号
+						writeCacheForR1 <- nil
+						writeCacheForR2 <- nil
+						return
+					}
+
+					// 分发R1和R2数据到各自的通道
+					select {
+					case writeCacheForR1 <- result:
+					case <-stopWriting:
+						return
+					}
+					select {
+					case writeCacheForR2 <- result:
+					case <-stopWriting:
+						return
+					}
+				case <-stopWriting:
+					return
+				}
+			}
+		}()
+
+		// 启动R1写入协程
+		go func() {
+			defer wg.Done()
+
+			r1Batch := make([]fastq.Sequence, 0, writeBatchSize)
+			for result := range writeCacheForR1 {
 				if result == nil {
-					// 结束信号
+					// 结束信号，写入最后一批
 					if len(r1Batch) > 0 {
 						writeR1Batch(r1Batch, bufferedW1)
-						writeR2Batch(r2Batch, bufferedW2)
 
 						// 更新统计
 						mu.Lock()
-						totalOutputReads += len(r1Batch)
+						totalOutputReads += int64(len(r1Batch))
 						for _, r := range r1Batch {
 							if containsPattern(string(r.Letters), pattern) {
 								keptPatternReads++
@@ -569,16 +669,12 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 				}
 
 				r1Batch = append(r1Batch, result.Seq1)
-				r2Batch = append(r2Batch, result.Seq2)
-
-				// 当达到10000条时，同步写入
-				if len(r1Batch) >= 10000 {
+				if len(r1Batch) >= writeBatchSize {
 					writeR1Batch(r1Batch, bufferedW1)
-					writeR2Batch(r2Batch, bufferedW2)
 
 					// 更新统计
 					mu.Lock()
-					totalOutputReads += len(r1Batch)
+					totalOutputReads += int64(len(r1Batch))
 					for _, r := range r1Batch {
 						if containsPattern(string(r.Letters), pattern) {
 							keptPatternReads++
@@ -586,13 +682,32 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 					}
 					mu.Unlock()
 
-					r1Batch = make([]fastq.Sequence, 0, 10000)
-					r2Batch = make([]fastq.Sequence, 0, 10000)
+					r1Batch = make([]fastq.Sequence, 0, writeBatchSize)
 				}
-			case <-stopWriting:
-				return
 			}
-		}
+		}()
+
+		// 启动R2写入协程
+		go func() {
+			defer wg.Done()
+
+			r2Batch := make([]fastq.Sequence, 0, writeBatchSize)
+			for result := range writeCacheForR2 {
+				if result == nil {
+					// 结束信号，写入最后一批
+					if len(r2Batch) > 0 {
+						writeR2Batch(r2Batch, bufferedW2)
+					}
+					return
+				}
+
+				r2Batch = append(r2Batch, result.Seq2)
+				if len(r2Batch) >= writeBatchSize {
+					writeR2Batch(r2Batch, bufferedW2)
+					r2Batch = make([]fastq.Sequence, 0, writeBatchSize)
+				}
+			}
+		}()
 	}()
 
 	// 等待R1、R2读取线程和配对线程完成
@@ -664,21 +779,25 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 }
 
 // 写入R1批次
-func writeR1Batch(batch []fastq.Sequence, writer *BufferedFastqWriter) {
+func writeR1Batch(batch []fastq.Sequence, writer *BufferedFastqWriter) error {
 	for _, seq := range batch {
 		if err := writer.Write(seq); err != nil {
 			log.Printf("Error writing R1: %v", err)
+			return err
 		}
 	}
+	return nil
 }
 
 // 写入R2批次
-func writeR2Batch(batch []fastq.Sequence, writer *BufferedFastqWriter) {
+func writeR2Batch(batch []fastq.Sequence, writer *BufferedFastqWriter) error {
 	for _, seq := range batch {
 		if err := writer.Write(seq); err != nil {
 			log.Printf("Error writing R2: %v", err)
+			return err
 		}
 	}
+	return nil
 }
 
 func main() {
@@ -686,6 +805,7 @@ func main() {
 	var fq1, fq2, pattern, outdir, pigzPath string
 	var percent, numWorkers int
 	var showVersion bool
+	var usePigzDecompress bool
 
 	flag.StringVar(&fq1, "fq1", "", "Input fastq file 1 (supports .gz format)")
 	flag.StringVar(&fq2, "fq2", "", "Input fastq file 2 (supports .gz format)")
@@ -695,6 +815,7 @@ func main() {
 	flag.IntVar(&numWorkers, "workers", 4, "Number of worker threads")
 	flag.StringVar(&pigzPath, "pigz", "", "Path to pigz executable for compression")
 	flag.BoolVar(&showVersion, "version", false, "Show version information")
+	flag.BoolVar(&usePigzDecompress, "pigz-decompress", false, "Use pigz for decompression (faster for gzip files)")
 
 	// 解析命令行参数
 	flag.Parse()
@@ -723,6 +844,31 @@ func main() {
 
 	// 执行高性能批量读取流水线模式
 	fmt.Println("Starting high-performance batch reading pipeline...")
+
+	// 如果启用pigz解压缩且指定了pigz路径
+	if usePigzDecompress && pigzPath != "" {
+		fmt.Println("Using pigz for decompression...")
+
+		// 解压缩gzip文件
+		if strings.HasSuffix(fq1, ".gz") {
+			decompressedFq1, err := decompressWithPigz(fq1, pigzPath, numWorkers)
+			if err != nil {
+				log.Fatalf("Failed to decompress %s: %v", fq1, err)
+			}
+			fq1 = decompressedFq1
+			defer os.Remove(decompressedFq1) // 处理完成后删除临时文件
+		}
+
+		if strings.HasSuffix(fq2, ".gz") {
+			decompressedFq2, err := decompressWithPigz(fq2, pigzPath, numWorkers)
+			if err != nil {
+				log.Fatalf("Failed to decompress %s: %v", fq2, err)
+			}
+			fq2 = decompressedFq2
+			defer os.Remove(decompressedFq2) // 处理完成后删除临时文件
+		}
+	}
+
 	err := mainPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
 	if err != nil {
 		log.Fatalf("Error: %v", err)
