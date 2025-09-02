@@ -4,7 +4,12 @@
 
 ## 功能特性
 
-过滤R2中含有指定序列的reads paire
+- **高性能批量读取**：双线程并行读取R1和R2文件，20K批次处理
+- **智能动态缓存**：根据worker数量自动调整缓存大小，优化内存使用
+- **多worker并行处理**：支持多线程并行处理，充分利用CPU资源
+- **同步配对输出**：确保R1和R2文件完全配对，避免数据丢失
+- **压缩文件支持**：原生支持gzip压缩文件格式
+- **静态链接构建**：提供完全静态链接的二进制文件，最大兼容性
 
 ## 安装
 
@@ -15,7 +20,7 @@
 go install github.com/seqyuan/patternqc@latest
 
 # 安装特定版本
-go install github.com/seqyuan/patternqc@v0.6.0
+go install github.com/seqyuan/patternqc@v0.8.0
 ```
 
 安装后，`patternqc` 命令会被安装到 `$GOPATH/bin` 目录中，确保该目录在你的 `PATH` 环境变量中。
@@ -24,7 +29,7 @@ go install github.com/seqyuan/patternqc@v0.6.0
 
 #### 依赖要求
 
-- Go 1.19 或更高版本
+- Go 1.22 或更高版本
 - `github.com/seqyuan/annogene` 包
 
 #### 编译步骤
@@ -33,7 +38,6 @@ go install github.com/seqyuan/patternqc@v0.6.0
 # 克隆仓库
 git clone https://github.com/seqyuan/patternqc.git
 cd patternqc
-
 
 # 编译
 go build -o patternqc patternqc.go
@@ -67,7 +71,7 @@ patternqc
 
 - `-pattern`：要搜索的 pattern（默认：`AGCAGTGGTATCAACGCAGAGTACA`）
 - `-percent`：保留 pattern reads 的百分比（0-100，默认：5）
-- `-mmap`：使用内存映射文件读取模式，提升大文件处理性能
+- `-workers`：worker线程数量（默认：4，建议6-8）
 - `-pigz`：pigz 可执行文件路径，用于压缩输出文件
 
 ### 使用示例
@@ -92,14 +96,14 @@ patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pattern "A
 patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pigz /usr/bin/pigz
 ```
 
-#### 使用内存映射模式（推荐用于大文件）
+#### 高并发处理
 ```bash
-patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -mmap
+patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -workers 8
 ```
 
-#### 内存映射模式 + 高并发处理
+#### 自定义pattern和高并发
 ```bash
-patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -mmap -workers 8
+patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pattern "AGCAGTGGTATCAACGCAGAGTACA" -percent 10 -workers 6
 ```
 
 ## 输出文件
@@ -127,9 +131,33 @@ patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -mmap -work
 
 1. **创建新版本标签**：
    ```bash
-   git tag v0.6.0
-   git push origin v0.6.0
+   git tag v0.8.0
+   git push origin v0.8.0
    ```
+
+2. **自动触发Release**：
+   - 推送tag后自动触发GitHub Actions
+   - 构建多平台二进制文件（Linux, Windows, macOS）
+   - 自动创建GitHub Release并上传文件
+
+## 性能优化
+
+### 动态缓存机制
+
+程序根据worker数量智能调整缓存大小：
+
+| Worker数量 | 写入缓存倍数 | 读取队列倍数 | 策略说明 |
+|------------|-------------|-------------|----------|
+| ≤4 | 5倍 | 3倍 | 增加缓冲，提高吞吐量 |
+| 5-7 | 4倍 | 2倍 | 平衡缓冲和内存使用 |
+| ≥8 | 3倍 | 2倍 | 减少缓冲，避免内存过度使用 |
+
+### 批量处理策略
+
+- **读取批次**：20K条reads为一批
+- **处理批次**：1000条reads为一批
+- **写入批次**：5000条reads为一批
+- **缓冲区大小**：16MB写入缓冲区
 
 ## 技术支持
 
