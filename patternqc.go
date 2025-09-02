@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	Version   = "0.8.0"
+	Version   = "0.8.1"
 	BuildTime = "2025-08-29"
 )
 
@@ -229,8 +229,8 @@ func (bfw *BufferedFastqWriter) Write(seq fastq.Sequence) error {
 
 	bfw.written++
 
-	// 定期刷新缓冲区
-	if bfw.written%10000 == 0 {
+	// 定期刷新缓冲区 - 减少刷新频率，提高I/O效率
+	if bfw.written%50000 == 0 {
 		return bfw.flush()
 	}
 
@@ -327,8 +327,8 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 	w2 := fastq.NewWriter(writer2)
 
 	// 创建高性能缓冲写入器，增加缓冲区大小
-	bufferedW1 := NewBufferedFastqWriter(w1, outFile1, 16*1024*1024) // 16MB缓冲区
-	bufferedW2 := NewBufferedFastqWriter(w2, outFile2, 16*1024*1024) // 16MB缓冲区
+	bufferedW1 := NewBufferedFastqWriter(w1, outFile1, 32*1024*1024) // 32MB缓冲区（增加100%）
+	bufferedW2 := NewBufferedFastqWriter(w2, outFile2, 32*1024*1024) // 32MB缓冲区（增加100%）
 	defer bufferedW1.Close()
 	defer bufferedW2.Close()
 
@@ -342,23 +342,23 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 	keepEveryN := 100 / percent
 
 	// 动态缓存配置 - 根据worker数量和系统性能优化
-	const workerBatchSize = 1000 // 每个worker一次处理1000条reads
-	const readBatchSize = 20000  // 读取批次大小20K
+	const workerBatchSize = 2000 // 每个worker一次处理2000条reads（增加100%）
+	const readBatchSize = 50000  // 读取批次大小50K（增加150%）
 
-	// 智能缓存容量计算
-	// 写入缓存：worker数量 * 批处理大小 * 缓冲倍数(3-5倍)
-	writeCacheMultiplier := 4
+	// 智能缓存容量计算 - 针对高worker数量优化
+	// 写入缓存：worker数量 * 批处理大小 * 缓冲倍数(2-3倍)
+	writeCacheMultiplier := 2
 	if numWorkers <= 4 {
-		writeCacheMultiplier = 5 // 少worker时增加缓冲
+		writeCacheMultiplier = 3 // 少worker时增加缓冲
 	} else if numWorkers >= 8 {
-		writeCacheMultiplier = 3 // 多worker时减少缓冲
+		writeCacheMultiplier = 2 // 多worker时减少缓冲，避免内存过度使用
 	}
 	writeCacheCapacity := int64(numWorkers) * workerBatchSize * int64(writeCacheMultiplier)
 
-	// 读取队列：worker数量 * 批处理大小 * 缓冲倍数(2-3倍)
-	readQueueMultiplier := 2
+	// 读取队列：worker数量 * 批处理大小 * 缓冲倍数(1-2倍)
+	readQueueMultiplier := 1
 	if numWorkers <= 4 {
-		readQueueMultiplier = 3 // 少worker时增加缓冲
+		readQueueMultiplier = 2 // 少worker时增加缓冲
 	}
 	readQueueCapacity := int64(numWorkers) * workerBatchSize * int64(readQueueMultiplier)
 
@@ -543,8 +543,8 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 			writeDone <- true
 		}()
 
-		r1Batch := make([]fastq.Sequence, 0, 5000)
-		r2Batch := make([]fastq.Sequence, 0, 5000)
+		r1Batch := make([]fastq.Sequence, 0, 10000) // 增加写入批次到10K
+		r2Batch := make([]fastq.Sequence, 0, 10000) // 增加写入批次到10K
 
 		for {
 			select {
@@ -571,8 +571,8 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 				r1Batch = append(r1Batch, result.Seq1)
 				r2Batch = append(r2Batch, result.Seq2)
 
-				// 当达到5000条时，同步写入
-				if len(r1Batch) >= 5000 {
+				// 当达到10000条时，同步写入
+				if len(r1Batch) >= 10000 {
 					writeR1Batch(r1Batch, bufferedW1)
 					writeR2Batch(r2Batch, bufferedW2)
 
@@ -586,8 +586,8 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 					}
 					mu.Unlock()
 
-					r1Batch = make([]fastq.Sequence, 0, 5000)
-					r2Batch = make([]fastq.Sequence, 0, 5000)
+					r1Batch = make([]fastq.Sequence, 0, 10000)
+					r2Batch = make([]fastq.Sequence, 0, 10000)
 				}
 			case <-stopWriting:
 				return

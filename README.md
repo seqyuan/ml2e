@@ -2,6 +2,16 @@
 
 一个基于go的高性能 FASTQ 文件过滤工具，支持多线程处理和压缩文件格式。
 
+## 功能特性
+
+- **高性能批量读取**：双线程并行读取R1和R2文件，50K批次处理
+- **智能动态缓存**：根据worker数量自动调整缓存大小，优化内存使用
+- **多worker并行处理**：支持多线程并行处理，充分利用CPU资源
+- **同步配对输出**：确保R1和R2文件完全配对，避免数据丢失
+- **压缩文件支持**：原生支持gzip压缩文件格式
+- **静态链接构建**：提供完全静态链接的二进制文件，最大兼容性
+- **I/O优化**：32MB写入缓冲区，减少磁盘I/O频率，提升写入性能
+
 ## 安装
 
 ### 方法一：使用 go install（推荐）
@@ -11,7 +21,7 @@
 go install github.com/seqyuan/patternqc@latest
 
 # 安装特定版本
-go install github.com/seqyuan/patternqc@v0.8.0
+go install github.com/seqyuan/patternqc@v0.8.1
 ```
 
 安装后，`patternqc` 命令会被安装到 `$GOPATH/bin` 目录中，确保该目录在你的 `PATH` 环境变量中。
@@ -122,14 +132,34 @@ patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pattern "A
 
 1. **创建新版本标签**：
    ```bash
-   git tag v0.8.0
-   git push origin v0.8.0
+   git tag v0.8.1
+   git push origin v0.8.1
    ```
 
 2. **自动触发Release**：
    - 推送tag后自动触发GitHub Actions
    - 构建多平台二进制文件（Linux, Windows, macOS）
    - 自动创建GitHub Release并上传文件
+
+## 性能优化
+
+### 动态缓存机制
+
+程序根据worker数量智能调整缓存大小：
+
+| Worker数量 | 写入缓存倍数 | 读取队列倍数 | 策略说明 |
+|------------|-------------|-------------|----------|
+| ≤4 | 3倍 | 2倍 | 增加缓冲，提高吞吐量 |
+| 5-7 | 2倍 | 1倍 | 平衡缓冲和内存使用 |
+| ≥8 | 2倍 | 1倍 | 减少缓冲，避免内存过度使用 |
+
+### 批量处理策略
+
+- **读取批次**：50K条reads为一批（优化I/O效率）
+- **处理批次**：2K条reads为一批（减少函数调用）
+- **写入批次**：10K条reads为一批（减少磁盘I/O）
+- **缓冲区大小**：32MB写入缓冲区（提升I/O性能）
+- **刷新频率**：50K条reads刷新一次（减少磁盘同步）
 
 ## 技术支持
 
