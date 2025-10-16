@@ -18,41 +18,22 @@ import (
 )
 
 const (
-	Version   = "0.10.0"
-	BuildTime = "2025-08-29"
+	Version   = "0.1.0"
+	BuildTime = "2025-10-16"
 )
 
 // 简化的结果结构 - 只需要配对信息
 type ProcessResult struct {
-	Seq1       fastq.Sequence
-	Seq2       fastq.Sequence
-	HasPattern bool
-	Keep       bool
+	Seq1 fastq.Sequence
+	Seq2 fastq.Sequence
 }
 
-// 反向互补序列
-func reverseComplement(pattern string) string {
-	complement := map[byte]byte{
-		'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G',
-		'a': 't', 't': 'a', 'g': 'c', 'c': 'g',
-		'N': 'N', 'n': 'n',
+// 修改readID中的@ML为@E
+func modifyReadID(readID string) string {
+	if strings.HasPrefix(readID, "@ML") {
+		return "@E" + readID[3:] // 将@ML替换为@E
 	}
-
-	result := make([]byte, len(pattern))
-	for i := len(pattern) - 1; i >= 0; i-- {
-		if comp, exists := complement[pattern[i]]; exists {
-			result[len(pattern)-1-i] = comp
-		} else {
-			result[len(pattern)-1-i] = pattern[i]
-		}
-	}
-	return string(result)
-}
-
-// 检查序列是否包含pattern或其反向互补序列
-func containsPattern(sequence, pattern string) bool {
-	revComp := reverseComplement(pattern)
-	return strings.Contains(sequence, pattern) || strings.Contains(sequence, revComp)
+	return readID
 }
 
 // 获取文件basename（保持原始扩展名，但移除.gz）
@@ -107,33 +88,36 @@ func createWriter(filePath string) (io.Writer, *os.File, error) {
 	return file, file, nil
 }
 
-// 处理单个read pair的worker函数 - 修复竞态条件
-func processReadPair(seq1, seq2 fastq.Sequence, pattern string, keepEveryN int, patternCount *int64, mu *sync.Mutex) *ProcessResult {
-	hasPattern := containsPattern(string(seq2.Letters), pattern)
+// 处理单个read pair的worker函数 - 修改readID
+func processReadPair(seq1, seq2 fastq.Sequence) *ProcessResult {
+	// 修改seq1的readID
+	modifiedSeq1 := fastq.Sequence{
+		ID1:     []byte(modifyReadID(string(seq1.ID1))),
+		Letters: seq1.Letters,
+		ID2:     seq1.ID2,
+		Quality: seq1.Quality,
+	}
 
-	var keep bool
-	if hasPattern {
-		// 使用原子操作获取当前计数
-		currentCount := atomic.AddInt64(patternCount, 1)
-		keep = currentCount%int64(keepEveryN) == 0
-	} else {
-		keep = true // 不包含pattern的read直接保留
+	// 修改seq2的readID
+	modifiedSeq2 := fastq.Sequence{
+		ID1:     []byte(modifyReadID(string(seq2.ID1))),
+		Letters: seq2.Letters,
+		ID2:     seq2.ID2,
+		Quality: seq2.Quality,
 	}
 
 	return &ProcessResult{
-		Seq1:       seq1,
-		Seq2:       seq2,
-		HasPattern: hasPattern,
-		Keep:       keep,
+		Seq1: modifiedSeq1,
+		Seq2: modifiedSeq2,
 	}
 }
 
 // 批量处理reads的worker函数
-func processReadPairBatch(readPairs []ReadPair, pattern string, keepEveryN int, patternCount *int64, mu *sync.Mutex) []*ProcessResult {
+func processReadPairBatch(readPairs []ReadPair) []*ProcessResult {
 	results := make([]*ProcessResult, 0, len(readPairs))
 
 	for _, readPair := range readPairs {
-		result := processReadPair(readPair.Seq1, readPair.Seq2, pattern, keepEveryN, patternCount, mu)
+		result := processReadPair(readPair.Seq1, readPair.Seq2)
 		results = append(results, result)
 	}
 
@@ -193,7 +177,7 @@ func decompressWithPigz(filePath, pigzPath string, numWorkers int) (string, erro
 	}
 
 	// 创建临时文件
-	tempFile, err := os.CreateTemp("", "patternqc_*.fq")
+	tempFile, err := os.CreateTemp("", "ml2e_*.fq")
 	if err != nil {
 		return filePath, fmt.Errorf("failed to create temp file: %v", err)
 	}
@@ -293,24 +277,21 @@ func (bfw *BufferedFastqWriter) Close() error {
 }
 
 func usage() {
-	fmt.Printf("\nProgram: patternqc - FastQ filtering based on sequence pattern (use 6-8 threads)\n")
-	fmt.Printf("Usage: patternqc [options]\n\n")
+	fmt.Printf("\nProgram: ml2e - FastQ read ID modifier (changes @ML to @E) (use 6-8 threads)\n")
+	fmt.Printf("Usage: ml2e [options]\n\n")
 	fmt.Printf("Options:\n")
 	fmt.Printf("  -fq1        Input fastq file 1 (supports .gz format)\n")
 	fmt.Printf("  -fq2        Input fastq file 2 (supports .gz format)\n")
-	fmt.Printf("  -pattern    Pattern to search for (default: AGCAGTGGTATCAACGCAGAGTACA)\n")
 	fmt.Printf("  -outdir     Output directory (required)\n")
-	fmt.Printf("  -percent    Percentage of pattern reads to keep (0-100, default: 5)\n")
 	fmt.Printf("  -workers    Number of worker threads (default: 4, recommend 6-8)\n")
 	fmt.Printf("  -pigz       Path to pigz executable for compression\n")
 	fmt.Printf("  -pigz-decompress  Use pigz for decompression (faster for gzip files)\n")
 	fmt.Printf("  -version    Show version information\n\n")
 	fmt.Printf("Examples:\n")
-	fmt.Printf("  patternqc -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output\n")
-	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -percent 5\n")
-	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz\n")
-	fmt.Printf("  patternqc -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz -pigz-decompress\n")
-	fmt.Printf("  patternqc -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output\n")
+	fmt.Printf("  ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output\n")
+	fmt.Printf("  ml2e -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output\n")
+	fmt.Printf("  ml2e -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz\n")
+	fmt.Printf("  ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz -pigz-decompress\n")
 	os.Exit(1)
 }
 
@@ -321,7 +302,7 @@ type ReadPair struct {
 }
 
 // 高性能批量读取流水线模式 - 动态缓存机制
-func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers int, pigzPath string) error {
+func mainPipelineMode(fq1, fq2, outdir string, numWorkers int, pigzPath string) error {
 	// 创建输出目录
 	if err := os.MkdirAll(outdir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %v", err)
@@ -374,12 +355,8 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 
 	// 统计变量
 	var totalReads int64
-	var keptPatternReads, totalOutputReads int64
-	var patternReadsInt int64
+	var totalOutputReads int64
 	var mu sync.Mutex
-
-	// 计算保留的pattern reads数量
-	keepEveryN := 100 / percent
 
 	// 动态缓存配置 - 针对gzip文件优化
 	const workerBatchSize = 2000 // 每个worker一次处理2000条reads
@@ -577,16 +554,14 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 
 			for readPairBatch := range readQueue {
 				// 批量处理reads
-				results := processReadPairBatch(readPairBatch, pattern, keepEveryN, &patternReadsInt, &mu)
+				results := processReadPairBatch(readPairBatch)
 
-				// 批量发送结果
+				// 批量发送结果 - 所有reads都保留
 				for _, result := range results {
-					if result.Keep {
-						select {
-						case writeCache <- result:
-						case <-stopProcessing:
-							return
-						}
+					select {
+					case writeCache <- result:
+					case <-stopProcessing:
+						return
 					}
 				}
 			}
@@ -658,11 +633,6 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 						// 更新统计
 						mu.Lock()
 						totalOutputReads += int64(len(r1Batch))
-						for _, r := range r1Batch {
-							if containsPattern(string(r.Letters), pattern) {
-								keptPatternReads++
-							}
-						}
 						mu.Unlock()
 					}
 					return
@@ -675,11 +645,6 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 					// 更新统计
 					mu.Lock()
 					totalOutputReads += int64(len(r1Batch))
-					for _, r := range r1Batch {
-						if containsPattern(string(r.Letters), pattern) {
-							keptPatternReads++
-						}
-					}
 					mu.Unlock()
 
 					r1Batch = make([]fastq.Sequence, 0, writeBatchSize)
@@ -742,31 +707,20 @@ func mainPipelineMode(fq1, fq2, pattern, outdir string, percent int, numWorkers 
 		fmt.Printf("Error flushing bufferedW2: %v\n", err)
 	}
 
-	// 确保在输出统计之前获取最终的patternReads值
-	mu.Lock()
-	finalPatternReads := patternReadsInt
-	mu.Unlock()
-
-	// 计算最终比例
-	pattern_sequence_keepRatio := 0.0
-	if totalReads > 0 {
-		pattern_sequence_keepRatio = float64(keptPatternReads) / float64(finalPatternReads) * 100.0
-	}
-
 	// 输出统计信息
 	statsFile := filepath.Join(outdir, basename2+".stats.txt")
-	statsContent := fmt.Sprintf("Total reads: %d\nOriginal pattern reads: %d\nKept pattern reads: %d\nTotal output reads: %d\nPattern sequence keep ratio: %.2f%%\n",
-		totalReads, finalPatternReads, keptPatternReads, totalOutputReads, pattern_sequence_keepRatio)
+	statsContent := fmt.Sprintf("Total reads processed: %d\nTotal output reads: %d\n",
+		totalReads, totalOutputReads)
 
 	if err := os.WriteFile(statsFile, []byte(statsContent), 0644); err != nil {
 		return fmt.Errorf("failed to write stats file: %v", err)
 	}
 
 	// 输出最终结果
-	fmt.Printf("\nHigh-performance batch reading pipeline completed. Results saved to: %s\n", statsFile)
-	fmt.Printf("Filtered files saved to: %s and %s\n", outFile1Path, outFile2Path)
-	fmt.Printf("Total reads: %d, Kept pattern reads: %d, Total output reads: %d, Pattern sequence keep ratio: %.2f%%\n",
-		totalReads, keptPatternReads, totalOutputReads, pattern_sequence_keepRatio)
+	fmt.Printf("\nRead ID modification pipeline completed. Results saved to: %s\n", statsFile)
+	fmt.Printf("Modified files saved to: %s and %s\n", outFile1Path, outFile2Path)
+	fmt.Printf("Total reads processed: %d, Total output reads: %d\n",
+		totalReads, totalOutputReads)
 
 	// 如果指定了pigz路径，进行压缩
 	if pigzPath != "" {
@@ -802,16 +756,14 @@ func writeR2Batch(batch []fastq.Sequence, writer *BufferedFastqWriter) error {
 
 func main() {
 	// 定义命令行参数
-	var fq1, fq2, pattern, outdir, pigzPath string
-	var percent, numWorkers int
+	var fq1, fq2, outdir, pigzPath string
+	var numWorkers int
 	var showVersion bool
 	var usePigzDecompress bool
 
 	flag.StringVar(&fq1, "fq1", "", "Input fastq file 1 (supports .gz format)")
 	flag.StringVar(&fq2, "fq2", "", "Input fastq file 2 (supports .gz format)")
-	flag.StringVar(&pattern, "pattern", "AGCAGTGGTATCAACGCAGAGTACA", "Pattern to search for")
 	flag.StringVar(&outdir, "outdir", "", "Output directory")
-	flag.IntVar(&percent, "percent", 5, "Percentage of pattern reads to keep (0-100)")
 	flag.IntVar(&numWorkers, "workers", 4, "Number of worker threads")
 	flag.StringVar(&pigzPath, "pigz", "", "Path to pigz executable for compression")
 	flag.BoolVar(&showVersion, "version", false, "Show version information")
@@ -822,7 +774,7 @@ func main() {
 
 	// 显示版本信息
 	if showVersion {
-		fmt.Printf("patternqc v%s (Build: %s)\n", Version, BuildTime)
+		fmt.Printf("ml2e v%s (Build: %s)\n", Version, BuildTime)
 		os.Exit(0)
 	}
 
@@ -832,18 +784,13 @@ func main() {
 		usage()
 	}
 
-	if percent < 0 || percent > 100 {
-		fmt.Println("Error: percent must be between 0 and 100")
-		usage()
-	}
-
 	if numWorkers < 1 {
 		fmt.Println("Error: workers must be at least 1")
 		usage()
 	}
 
 	// 执行高性能批量读取流水线模式
-	fmt.Println("Starting high-performance batch reading pipeline...")
+	fmt.Println("Starting read ID modification pipeline...")
 
 	// 如果启用pigz解压缩且指定了pigz路径
 	if usePigzDecompress && pigzPath != "" {
@@ -869,7 +816,7 @@ func main() {
 		}
 	}
 
-	err := mainPipelineMode(fq1, fq2, pattern, outdir, percent, numWorkers, pigzPath)
+	err := mainPipelineMode(fq1, fq2, outdir, numWorkers, pigzPath)
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 	}

@@ -1,120 +1,65 @@
-# PatternQC - FASTQ 过滤含有固定序列reads的工具
+# ml2e - FastQ read ID modifier
 
-一个基于go的高性能 FASTQ 文件过滤工具，支持多线程处理和压缩文件格式。
+一个基于Go的高性能FastQ文件readID修改工具，将readID中的`@ML`前缀替换为`@E`前缀。
 
 ## 功能特性
 
-- **高性能批量读取**：双线程并行读取R1和R2文件，50K批次处理
-- **智能动态缓存**：根据worker数量自动调整缓存大小，优化内存使用
-- **多worker并行处理**：支持多线程并行处理，充分利用CPU资源
-- **同步配对输出**：确保R1和R2文件完全配对，避免数据丢失
+- **高性能批量处理**：支持多线程并行处理，充分利用CPU资源
 - **压缩文件支持**：原生支持gzip压缩文件格式
-- **静态链接构建**：提供完全静态链接的二进制文件，最大兼容性
-- **I/O优化**：32MB写入缓冲区，减少磁盘I/O频率，提升写入性能
-
-## 安装
-
-### 方法一：使用 go install（推荐）
-
-```bash
-# 安装最新版本
-go install github.com/seqyuan/patternqc@latest
-
-# 安装特定版本
-go install github.com/seqyuan/patternqc@v0.8.1
-```
-
-安装后，`patternqc` 命令会被安装到 `$GOPATH/bin` 目录中，确保该目录在你的 `PATH` 环境变量中。
-
-### 方法二：从源码编译
-
-#### 依赖要求
-
-- Go 1.22 或更高版本
-- `github.com/seqyuan/annogene` 包
-
-#### 编译步骤
-
-```bash
-# 克隆仓库
-git clone https://github.com/seqyuan/patternqc.git
-cd patternqc
-
-# 编译
-go build -o patternqc patternqc.go
-```
-
-### 验证安装
-
-```bash
-# 检查版本
-patternqc -version
-
-# 查看帮助
-patternqc
-```
+- **动态缓存机制**：根据worker数量自动调整缓存大小，优化内存使用
+- **pigz集成**：支持使用pigz进行快速压缩和解压缩
 
 ## 使用方法
 
 ### 基本语法
 
 ```bash
-./patternqc [选项]
+ml2e [选项]
 ```
 
 ### 必需参数
 
-- `-fq1`：输入 FASTQ 文件 1（支持 `.gz` 格式）
-- `-fq2`：输入 FASTQ 文件 2（支持 `.gz` 格式）
+- `-fq1`：输入FastQ文件1（支持`.gz`格式）
+- `-fq2`：输入FastQ文件2（支持`.gz`格式）
 - `-outdir`：输出目录
 
 ### 可选参数
 
-- `-pattern`：要搜索的 pattern（默认：`AGCAGTGGTATCAACGCAGAGTACA`）
-- `-percent`：保留 pattern reads 的百分比（0-100，默认：5）
 - `-workers`：worker线程数量（默认：4，建议6-8）
-- `-pigz`：pigz 可执行文件路径，用于压缩输出文件
+- `-pigz`：pigz可执行文件路径，用于压缩输出文件
+- `-pigz-decompress`：使用pigz进行解压缩（对gzip文件更快）
+- `-version`：显示版本信息
 
 ### 使用示例
 
 #### 基本使用
 ```bash
-patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result
-```
-
-#### 自定义参数
-```bash
-patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -percent 10
-```
-
-#### 自定义 pattern
-```bash
-patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pattern "AGCAGTGGTATCAACGCAGAGTACA" -percent 5
-```
-
-#### 使用 pigz 压缩输出
-```bash
-patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pigz /usr/bin/pigz
+ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output
 ```
 
 #### 高并发处理
 ```bash
-patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -workers 8
+ml2e -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -workers 8
 ```
 
-#### 自定义pattern和高并发
+#### 使用pigz压缩输出
 ```bash
-patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pattern "AGCAGTGGTATCAACGCAGAGTACA" -percent 10 -workers 6
+ml2e -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz
+```
+
+#### 使用pigz解压缩
+```bash
+ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz -pigz-decompress
 ```
 
 ## 输出文件
 
 程序会在指定的输出目录中生成以下文件：
 
-1. **过滤后的 FASTQ 文件**：
-   - `{原文件名1}`：过滤后的 R1 文件
-   - `{原文件名2}`：过滤后的 R2 文件
-   - 如果指定了 `-pigz` 参数，文件将被压缩为 `.gz` 格式
+1. **修改后的FastQ文件**：
+   - `{原文件名1}`：修改后的R1文件
+   - `{原文件名2}`：修改后的R2文件
+   - 如果指定了`-pigz`参数，文件将被压缩为`.gz`格式
 
 2. **统计报告**：
    - `{原文件名2}.stats.txt`：包含处理统计信息
@@ -122,45 +67,13 @@ patternqc -fq1 ./data/f1.fq.gz -fq2 ./data/f2.fq.gz -outdir ./result -pattern "A
 ### 统计报告内容
 
 统计报告包含以下信息：
-- 总 reads 数量
-- 原始 pattern reads 数量
-- 保留的 pattern reads 数量
-- 最终比例
+- 总reads处理数量
+- 总输出reads数量
 
+## 工作原理
 
-### 自动发布流程
+程序会将所有readID中开头的`@ML`替换为`@E`，其他内容保持不变。例如：
+- `@ML12345:1:1101:1000:2211/1` → `@E12345:1:1101:1000:2211/1`
+- `@AB12345:1:1101:1000:2211/1` → `@AB12345:1:1101:1000:2211/1`（保持不变）
 
-1. **创建新版本标签**：
-   ```bash
-   git tag v0.8.1
-   git push origin v0.8.1
-   ```
-
-2. **自动触发Release**：
-   - 推送tag后自动触发GitHub Actions
-   - 构建多平台二进制文件（Linux, Windows, macOS）
-   - 自动创建GitHub Release并上传文件
-
-## 性能优化
-
-### 动态缓存机制
-
-程序根据worker数量智能调整缓存大小：
-
-| Worker数量 | 写入缓存倍数 | 读取队列倍数 | 策略说明 |
-|------------|-------------|-------------|----------|
-| ≤4 | 3倍 | 2倍 | 增加缓冲，提高吞吐量 |
-| 5-7 | 2倍 | 1倍 | 平衡缓冲和内存使用 |
-| ≥8 | 2倍 | 1倍 | 减少缓冲，避免内存过度使用 |
-
-### 批量处理策略
-
-- **读取批次**：50K条reads为一批（优化I/O效率）
-- **处理批次**：2K条reads为一批（减少函数调用）
-- **写入批次**：10K条reads为一批（减少磁盘I/O）
-- **缓冲区大小**：32MB写入缓冲区（提升I/O性能）
-- **刷新频率**：50K条reads刷新一次（减少磁盘同步）
-
-## 技术支持
-
-如有问题或建议，请联系开发团队。
+所有reads都会被保留并输出，只是readID会被修改。
