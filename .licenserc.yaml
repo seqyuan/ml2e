@@ -4,8 +4,11 @@ header:
     copyright-owner: seqyuan
   paths-ignore:
     - "*.md"
-    - "*.yml"
+    - ".github/workflows/*.yml"
+    - ".github/workflows/*.yaml"
     - "*.yaml"
     - ".gitignore"
     - "go.mod"
     - "go.sum"
+    - "test*.sh"
+    - "*.sh"
