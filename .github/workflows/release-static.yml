@@ -92,9 +92,6 @@ jobs:
         files: |
           ml2e-linux-amd64/ml2e-linux-amd64
           ml2e-linux-arm64/ml2e-linux-arm64
-          ml2e-windows-amd64/ml2e-windows-amd64
-          ml2e-darwin-amd64/ml2e-darwin-amd64
-          ml2e-darwin-arm64/ml2e-darwin-arm64
         draft: false
         prerelease: false
         generate_release_notes: true
