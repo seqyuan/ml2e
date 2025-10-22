@@ -38,8 +38,14 @@ import (
 )
 
 const (
-	Version   = "0.1.7"
+	Version   = "0.1.8"
 	BuildTime = "2025-10-16"
+)
+
+// 默认的替换配置
+const (
+	DefaultFromPrefix = "ML15"
+	DefaultToPrefix   = "E251"
 )
 
 // 简化的结果结构 - 只需要配对信息
@@ -48,10 +54,11 @@ type ProcessResult struct {
 	Seq2 fastq.Sequence
 }
 
-// 修改readID中的@ML15为@E251
-func modifyReadID(readID string) string {
-	if strings.HasPrefix(readID, "@ML15") {
-		return "@E251" + readID[5:] // 将@ML15替换为@E251
+// 修改readID中的指定前缀
+func modifyReadID(readID, fromPrefix, toPrefix string) string {
+	fromPattern := "@" + fromPrefix
+	if strings.HasPrefix(readID, fromPattern) {
+		return "@" + toPrefix + readID[len(fromPattern):]
 	}
 	return readID
 }
@@ -109,10 +116,10 @@ func createWriter(filePath string) (io.Writer, *os.File, error) {
 }
 
 // 处理单个read pair的worker函数 - 修改readID
-func processReadPair(seq1, seq2 fastq.Sequence) *ProcessResult {
+func processReadPair(seq1, seq2 fastq.Sequence, fromPrefix, toPrefix string) *ProcessResult {
 	// 修改seq1的readID
 	modifiedSeq1 := fastq.Sequence{
-		ID1:     []byte(modifyReadID(string(seq1.ID1))),
+		ID1:     []byte(modifyReadID(string(seq1.ID1), fromPrefix, toPrefix)),
 		Letters: seq1.Letters,
 		ID2:     seq1.ID2,
 		Quality: seq1.Quality,
@@ -120,7 +127,7 @@ func processReadPair(seq1, seq2 fastq.Sequence) *ProcessResult {
 
 	// 修改seq2的readID
 	modifiedSeq2 := fastq.Sequence{
-		ID1:     []byte(modifyReadID(string(seq2.ID1))),
+		ID1:     []byte(modifyReadID(string(seq2.ID1), fromPrefix, toPrefix)),
 		Letters: seq2.Letters,
 		ID2:     seq2.ID2,
 		Quality: seq2.Quality,
@@ -133,11 +140,11 @@ func processReadPair(seq1, seq2 fastq.Sequence) *ProcessResult {
 }
 
 // 批量处理reads的worker函数
-func processReadPairBatch(readPairs []ReadPair) []*ProcessResult {
+func processReadPairBatch(readPairs []ReadPair, fromPrefix, toPrefix string) []*ProcessResult {
 	results := make([]*ProcessResult, 0, len(readPairs))
 
 	for _, readPair := range readPairs {
-		result := processReadPair(readPair.Seq1, readPair.Seq2)
+		result := processReadPair(readPair.Seq1, readPair.Seq2, fromPrefix, toPrefix)
 		results = append(results, result)
 	}
 
@@ -297,12 +304,14 @@ func (bfw *BufferedFastqWriter) Close() error {
 }
 
 func usage() {
-	fmt.Printf("\nProgram: ml2e - FastQ read ID modifier (changes @ML15 to @E251) (use 6-8 threads)\n")
+	fmt.Printf("\nProgram: ml2e - FastQ read ID modifier (configurable prefix replacement) (use 6-8 threads)\n")
 	fmt.Printf("Usage: ml2e [options]\n\n")
 	fmt.Printf("Options:\n")
 	fmt.Printf("  -fq1        Input fastq file 1 (supports .gz format)\n")
 	fmt.Printf("  -fq2        Input fastq file 2 (supports .gz format)\n")
 	fmt.Printf("  -outdir     Output directory (required)\n")
+	fmt.Printf("  -from       Source prefix to replace (default: ML15)\n")
+	fmt.Printf("  -to         Target prefix to replace with (default: E251)\n")
 	fmt.Printf("  -workers    Number of worker threads (default: 4, recommend 6-8)\n")
 	fmt.Printf("  -pigz       Path to pigz executable for compression\n")
 	fmt.Printf("  -pigz-decompress  Use pigz for decompression (faster for gzip files)\n")
@@ -310,8 +319,9 @@ func usage() {
 	fmt.Printf("Examples:\n")
 	fmt.Printf("  ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output\n")
 	fmt.Printf("  ml2e -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output\n")
-	fmt.Printf("  ml2e -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz\n")
-	fmt.Printf("  ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz -pigz-decompress\n")
+	fmt.Printf("  ml2e -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -from ML15 -to E251\n")
+	fmt.Printf("  ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz\n")
+	fmt.Printf("  ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output -from ML15 -to E251 -workers 8\n")
 	os.Exit(1)
 }
 
@@ -322,7 +332,7 @@ type ReadPair struct {
 }
 
 // 高性能批量读取流水线模式 - 动态缓存机制
-func mainPipelineMode(fq1, fq2, outdir string, numWorkers int, pigzPath string) error {
+func mainPipelineMode(fq1, fq2, outdir, fromPrefix, toPrefix string, numWorkers int, pigzPath string) error {
 	// 创建输出目录
 	if err := os.MkdirAll(outdir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %v", err)
@@ -574,7 +584,7 @@ func mainPipelineMode(fq1, fq2, outdir string, numWorkers int, pigzPath string) 
 
 			for readPairBatch := range readQueue {
 				// 批量处理reads
-				results := processReadPairBatch(readPairBatch)
+				results := processReadPairBatch(readPairBatch, fromPrefix, toPrefix)
 
 				// 批量发送结果 - 所有reads都保留
 				for _, result := range results {
@@ -776,7 +786,7 @@ func writeR2Batch(batch []fastq.Sequence, writer *BufferedFastqWriter) error {
 
 func main() {
 	// 定义命令行参数
-	var fq1, fq2, outdir, pigzPath string
+	var fq1, fq2, outdir, fromPrefix, toPrefix, pigzPath string
 	var numWorkers int
 	var showVersion bool
 	var usePigzDecompress bool
@@ -784,6 +794,8 @@ func main() {
 	flag.StringVar(&fq1, "fq1", "", "Input fastq file 1 (supports .gz format)")
 	flag.StringVar(&fq2, "fq2", "", "Input fastq file 2 (supports .gz format)")
 	flag.StringVar(&outdir, "outdir", "", "Output directory")
+	flag.StringVar(&fromPrefix, "from", DefaultFromPrefix, "Source prefix to replace")
+	flag.StringVar(&toPrefix, "to", DefaultToPrefix, "Target prefix to replace with")
 	flag.IntVar(&numWorkers, "workers", 4, "Number of worker threads")
 	flag.StringVar(&pigzPath, "pigz", "", "Path to pigz executable for compression")
 	flag.BoolVar(&showVersion, "version", false, "Show version information")
@@ -836,7 +848,7 @@ func main() {
 		}
 	}
 
-	err := mainPipelineMode(fq1, fq2, outdir, numWorkers, pigzPath)
+	err := mainPipelineMode(fq1, fq2, outdir, fromPrefix, toPrefix, numWorkers, pigzPath)
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 	}
