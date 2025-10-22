@@ -105,8 +105,8 @@ go build -o ml2e ml2e.go
 
 ```shell
 git add -A
-git commit -m "v0.1.9"
-git tag v0.1.9
+git commit -m "v0.2.0"
+git tag v0.2.0
 git push origin main
-git push origin v0.1.9
+git push origin v0.2.0
 ```

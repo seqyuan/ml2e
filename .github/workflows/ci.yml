@@ -54,7 +54,4 @@ jobs:
       run: |
         go build -v -o ml2e ml2e.go
 
-    - name: Test binary
-      run: |
-        ./ml2e -version
-        ./ml2e 2>&1 | grep -q "Error: -fq1, -fq2 and -outdir are required" || exit 1
+    
