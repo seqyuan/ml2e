@@ -38,7 +38,7 @@ import (
 )
 
 const (
-	Version   = "0.1.8"
+	Version   = "0.1.9"
 	BuildTime = "2025-10-16"
 )
 
@@ -309,7 +309,8 @@ func usage() {
 	fmt.Printf("Options:\n")
 	fmt.Printf("  -fq1        Input fastq file 1 (supports .gz format)\n")
 	fmt.Printf("  -fq2        Input fastq file 2 (supports .gz format)\n")
-	fmt.Printf("  -outdir     Output directory (required)\n")
+	fmt.Printf("  -r1         Output file path for R1 (without .gz suffix)\n")
+	fmt.Printf("  -r2         Output file path for R2 (without .gz suffix)\n")
 	fmt.Printf("  -from       Source prefix to replace (default: ML15)\n")
 	fmt.Printf("  -to         Target prefix to replace with (default: E251)\n")
 	fmt.Printf("  -workers    Number of worker threads (default: 4, recommend 6-8)\n")
@@ -317,11 +318,11 @@ func usage() {
 	fmt.Printf("  -pigz-decompress  Use pigz for decompression (faster for gzip files)\n")
 	fmt.Printf("  -version    Show version information\n\n")
 	fmt.Printf("Examples:\n")
-	fmt.Printf("  ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output\n")
-	fmt.Printf("  ml2e -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output\n")
-	fmt.Printf("  ml2e -fq1 input1.fastq -fq2 input2.fastq.gz -outdir output -from ML15 -to E251\n")
-	fmt.Printf("  ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pigz\n")
-	fmt.Printf("  ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output -from ML15 -to E251 -workers 8\n")
+	fmt.Printf("  ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -r1 output1.fastq -r2 output2.fastq\n")
+	fmt.Printf("  ml2e -fq1 input1.fastq -fq2 input2.fastq.gz -r1 output1.fastq -r2 output2.fastq\n")
+	fmt.Printf("  ml2e -fq1 input1.fastq -fq2 input2.fastq -r1 output1.fastq -r2 output2.fastq -from ML15 -to E251\n")
+	fmt.Printf("  ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -r1 output1.fastq -r2 output2.fastq -pigz /usr/bin/pigz\n")
+	fmt.Printf("  ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -r1 output1.fastq -r2 output2.fastq -from ML15 -to E251 -workers 8\n")
 	os.Exit(1)
 }
 
@@ -332,10 +333,16 @@ type ReadPair struct {
 }
 
 // 高性能批量读取流水线模式 - 动态缓存机制
-func mainPipelineMode(fq1, fq2, outdir, fromPrefix, toPrefix string, numWorkers int, pigzPath string) error {
+func mainPipelineMode(fq1, fq2, r1, r2, fromPrefix, toPrefix string, numWorkers int, pigzPath string) error {
 	// 创建输出目录
-	if err := os.MkdirAll(outdir, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory: %v", err)
+	r1Dir := filepath.Dir(r1)
+	r2Dir := filepath.Dir(r2)
+
+	if err := os.MkdirAll(r1Dir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory for R1: %v", err)
+	}
+	if err := os.MkdirAll(r2Dir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory for R2: %v", err)
 	}
 
 	// 创建输入文件reader
@@ -356,18 +363,13 @@ func mainPipelineMode(fq1, fq2, outdir, fromPrefix, toPrefix string, numWorkers 
 	scanner2 := fastq.NewScanner(fastq.NewReader(reader2))
 
 	// 创建输出文件
-	basename1 := getBasename(fq1)
-	basename2 := getBasename(fq2)
-	outFile1Path := filepath.Join(outdir, basename1)
-	outFile2Path := filepath.Join(outdir, basename2)
-
-	writer1, outFile1, err := createWriter(outFile1Path)
+	writer1, outFile1, err := createWriter(r1)
 	if err != nil {
 		return err
 	}
 	defer outFile1.Close()
 
-	writer2, outFile2, err := createWriter(outFile2Path)
+	writer2, outFile2, err := createWriter(r2)
 	if err != nil {
 		return err
 	}
@@ -738,7 +740,7 @@ func mainPipelineMode(fq1, fq2, outdir, fromPrefix, toPrefix string, numWorkers 
 	}
 
 	// 输出统计信息
-	statsFile := filepath.Join(outdir, basename2+".stats.txt")
+	statsFile := r2 + ".stats.txt"
 	statsContent := fmt.Sprintf("Total reads processed: %d\nTotal output reads: %d\n",
 		totalReads, totalOutputReads)
 
@@ -748,13 +750,13 @@ func mainPipelineMode(fq1, fq2, outdir, fromPrefix, toPrefix string, numWorkers 
 
 	// 输出最终结果
 	fmt.Printf("\nRead ID modification pipeline completed. Results saved to: %s\n", statsFile)
-	fmt.Printf("Modified files saved to: %s and %s\n", outFile1Path, outFile2Path)
+	fmt.Printf("Modified files saved to: %s and %s\n", r1, r2)
 	fmt.Printf("Total reads processed: %d, Total output reads: %d\n",
 		totalReads, totalOutputReads)
 
 	// 如果指定了pigz路径，进行压缩
 	if pigzPath != "" {
-		if err := compressWithPigz(outFile1Path, outFile2Path, pigzPath, numWorkers); err != nil {
+		if err := compressWithPigz(r1, r2, pigzPath, numWorkers); err != nil {
 			return fmt.Errorf("failed to compress output files: %v", err)
 		}
 	}
@@ -786,14 +788,15 @@ func writeR2Batch(batch []fastq.Sequence, writer *BufferedFastqWriter) error {
 
 func main() {
 	// 定义命令行参数
-	var fq1, fq2, outdir, fromPrefix, toPrefix, pigzPath string
+	var fq1, fq2, r1, r2, fromPrefix, toPrefix, pigzPath string
 	var numWorkers int
 	var showVersion bool
 	var usePigzDecompress bool
 
 	flag.StringVar(&fq1, "fq1", "", "Input fastq file 1 (supports .gz format)")
 	flag.StringVar(&fq2, "fq2", "", "Input fastq file 2 (supports .gz format)")
-	flag.StringVar(&outdir, "outdir", "", "Output directory")
+	flag.StringVar(&r1, "r1", "", "Output file path for R1 (without .gz suffix)")
+	flag.StringVar(&r2, "r2", "", "Output file path for R2 (without .gz suffix)")
 	flag.StringVar(&fromPrefix, "from", DefaultFromPrefix, "Source prefix to replace")
 	flag.StringVar(&toPrefix, "to", DefaultToPrefix, "Target prefix to replace with")
 	flag.IntVar(&numWorkers, "workers", 4, "Number of worker threads")
@@ -811,8 +814,8 @@ func main() {
 	}
 
 	// 验证必需参数
-	if fq1 == "" || fq2 == "" || outdir == "" {
-		fmt.Println("Error: -fq1, -fq2 and -outdir are required")
+	if fq1 == "" || fq2 == "" || r1 == "" || r2 == "" {
+		fmt.Println("Error: -fq1, -fq2, -r1 and -r2 are required")
 		usage()
 	}
 
@@ -848,7 +851,7 @@ func main() {
 		}
 	}
 
-	err := mainPipelineMode(fq1, fq2, outdir, fromPrefix, toPrefix, numWorkers, pigzPath)
+	err := mainPipelineMode(fq1, fq2, r1, r2, fromPrefix, toPrefix, numWorkers, pigzPath)
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 	}
