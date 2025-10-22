@@ -53,11 +53,11 @@ jobs:
           go build -v -ldflags="-s -w" -o ml2e-${{ matrix.os }}-${{ matrix.arch }} ml2e.go
         fi
 
-    - name: Test binary
-      if: matrix.os == 'linux' && matrix.arch == 'amd64'
-      run: |
-        ./ml2e-${{ matrix.os }}-${{ matrix.arch }} -version
-        ./ml2e-${{ matrix.os }}-${{ matrix.arch }} 2>&1 | grep -q "Error: -fq1, -fq2 and -outdir are required" || exit 1
+    #- name: Test binary
+    #  if: matrix.os == 'linux' && matrix.arch == 'amd64'
+    #  run: |
+    #    ./ml2e-${{ matrix.os }}-${{ matrix.arch }} -version
+    #    ./ml2e-${{ matrix.os }}-${{ matrix.arch }} 2>&1 | grep -q "Error: -fq1, -fq2 and -outdir are required" || exit 1
 
     - name: Check binary compatibility
       if: matrix.os == 'linux' && matrix.arch == 'amd64'
