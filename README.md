@@ -79,12 +79,34 @@ ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pig
 所有reads都会被保留并输出，只是readID会被修改。
 
 
-## release
+## 安装
+
+### 使用 go install 安装
+
+```bash
+# 安装最新版本
+go install github.com/seqyuan/ml2e@latest
+
+# 安装特定版本
+go install github.com/seqyuan/ml2e@v0.1.7
+```
+
+安装后，程序会位于 `$GOPATH/bin/ml2e`，确保该目录在您的PATH环境变量中。
+
+### 从源码构建
+
+```bash
+git clone https://github.com/seqyuan/ml2e.git
+cd ml2e
+go build -o ml2e ml2e.go
+```
+
+## Release
+
 ```shell
 git add -A
 git commit -m "release"
-git tag v0.1.6
+git tag v0.1.7
 git push origin main
-
-git push origin v0.1.6
+git push origin v0.1.7
 ```
