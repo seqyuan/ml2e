@@ -77,3 +77,14 @@ ml2e -fq1 input1.fastq.gz -fq2 input2.fastq.gz -outdir output -pigz /usr/bin/pig
 - `@AB12345:1:1101:1000:2211/1` → `@AB12345:1:1101:1000:2211/1`（保持不变）
 
 所有reads都会被保留并输出，只是readID会被修改。
+
+
+## release
+```shell
+git add -A
+git commit -m "release"
+git tag v0.1.6
+git push origin main
+
+git push origin v0.1.6
+```

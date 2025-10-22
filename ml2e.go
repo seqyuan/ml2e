@@ -38,7 +38,7 @@ import (
 )
 
 const (
-	Version   = "0.1.5"
+	Version   = "0.1.6"
 	BuildTime = "2025-10-16"
 )
 
@@ -411,8 +411,8 @@ func mainPipelineMode(fq1, fq2, outdir string, numWorkers int, pigzPath string) 
 	const batchQueueSize = 15 // 适中的队列大小，避免gzip读取阻塞
 
 	// 输出配置信息
-	#fmt.Printf("Configuration: workers=%d, read_batch=%d, worker_batch=%d, write_batch=%d\n",
-	#	numWorkers, readBatchSize, workerBatchSize, writeBatchSize)
+	//fmt.Printf("Configuration: workers=%d, read_batch=%d, worker_batch=%d, write_batch=%d\n",
+	//	numWorkers, readBatchSize, workerBatchSize, writeBatchSize)
 
 	// 检测gzip文件并输出优化提示
 	if strings.HasSuffix(fq1, ".gz") || strings.HasSuffix(fq2, ".gz") {
@@ -530,7 +530,7 @@ func mainPipelineMode(fq1, fq2, outdir string, numWorkers int, pigzPath string) 
 							currentReads := atomic.AddInt64(&totalReads, int64(len(readPairBatch)))
 							// 每读取2M reads输出进度
 							if currentReads%2000000 == 0 {
-								fmt.Printf("Read %d reads (batch mode, worker batch size: %d)\n", currentReads, workerBatchSize)
+								fmt.Printf("Read %d reads\n", currentReads)
 							}
 							readPairBatch = make([]ReadPair, 0, workerBatchSize)
 						case <-stopReading:
