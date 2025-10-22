@@ -38,7 +38,7 @@ import (
 )
 
 const (
-	Version   = "0.1.4"
+	Version   = "0.1.5"
 	BuildTime = "2025-10-16"
 )
 
@@ -48,10 +48,10 @@ type ProcessResult struct {
 	Seq2 fastq.Sequence
 }
 
-// 修改readID中的@ML为@E
+// 修改readID中的@ML15为@E251
 func modifyReadID(readID string) string {
-	if strings.HasPrefix(readID, "@ML") {
-		return "@E" + readID[3:] // 将@ML替换为@E
+	if strings.HasPrefix(readID, "@ML15") {
+		return "@E251" + readID[5:] // 将@ML15替换为@E251
 	}
 	return readID
 }
@@ -297,7 +297,7 @@ func (bfw *BufferedFastqWriter) Close() error {
 }
 
 func usage() {
-	fmt.Printf("\nProgram: ml2e - FastQ read ID modifier (changes @ML to @E) (use 6-8 threads)\n")
+	fmt.Printf("\nProgram: ml2e - FastQ read ID modifier (changes @ML15 to @E251) (use 6-8 threads)\n")
 	fmt.Printf("Usage: ml2e [options]\n\n")
 	fmt.Printf("Options:\n")
 	fmt.Printf("  -fq1        Input fastq file 1 (supports .gz format)\n")
@@ -411,8 +411,8 @@ func mainPipelineMode(fq1, fq2, outdir string, numWorkers int, pigzPath string) 
 	const batchQueueSize = 15 // 适中的队列大小，避免gzip读取阻塞
 
 	// 输出配置信息
-	fmt.Printf("Configuration: workers=%d, read_batch=%d, worker_batch=%d, write_batch=%d\n",
-		numWorkers, readBatchSize, workerBatchSize, writeBatchSize)
+	#fmt.Printf("Configuration: workers=%d, read_batch=%d, worker_batch=%d, write_batch=%d\n",
+	#	numWorkers, readBatchSize, workerBatchSize, writeBatchSize)
 
 	// 检测gzip文件并输出优化提示
 	if strings.HasSuffix(fq1, ".gz") || strings.HasSuffix(fq2, ".gz") {
